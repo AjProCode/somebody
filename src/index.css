@@ -1,0 +1,389 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Outfit', 'Noto Sans Devanagari', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', 'Noto Sans Devanagari', sans-serif;
+    --font-mono: 'JetBrains Mono', 'Noto Sans Devanagari', monospace;
+    --jaipuria-navy: #0B2559;
+    --ink-black: #0A0A0A;
+    --off-white: #F8F8F6;
+    --surface-white: #FFFFFF;
+    --hairline-light: #DCDFE6;
+  }
+
+  html,
+  body {
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+    scroll-behavior: smooth;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid #0B2559;
+    outline-offset: 2px;
+  }
+
+  .dark button:focus-visible,
+  .dark a:focus-visible,
+  .dark input:focus-visible,
+  .dark select:focus-visible,
+  .dark textarea:focus-visible {
+    outline: 2px solid #FFFFFF;
+    outline-offset: 2px;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.pb-safe {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+}
+
+.pt-safe {
+  padding-top: max(0px, env(safe-area-inset-top, 0px));
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@media (max-width: 640px) {
+  input[type="text"],
+  input[type="search"],
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* ============================================================================
+ * MINIMAL MONOCHROME-NAVY ARCHITECTURAL SURFACES (ZERO 3D, ZERO OVERLAP)
+ * ========================================================================== */
+.editorial-surface {
+  background-color: #FFFFFF;
+  border: 1px solid #0B2559;
+}
+
+.dark .editorial-surface {
+  background-color: #111622;
+  border: 1px solid #2A3244;
+}
+
+.editorial-panel {
+  background-color: #F8F8F6;
+  border: 1px solid #DCDFE6;
+}
+
+.dark .editorial-panel {
+  background-color: #0A0D14;
+  border: 1px solid #1E2534;
+}
+
+.block-card {
+  background-color: #FFFFFF;
+  border: 1px solid #DCDFE6;
+}
+
+.dark .block-card {
+  background-color: #111622;
+  border: 1px solid #2A3244;
+}
+
+body.light-mode {
+  background-color: #F8F8F6;
+  color: #0A0A0A;
+}
+
+body:not(.light-mode) {
+  background-color: #0A0D14;
+  color: #F4F4F0;
+}
+
+/* ============================================================================
+ * MEDHAVI SCHOLARLY PROSE & KATEX MATH STYLING
+ * ========================================================================== */
+.medhavi-prose {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.medhavi-prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  padding: 0.35rem 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+.medhavi-prose h1,
+.medhavi-prose h2,
+.medhavi-prose h3,
+.medhavi-prose h4 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-top: 1.4rem;
+  margin-bottom: 0.6rem;
+}
+
+.medhavi-prose h2 {
+  font-size: 1.25rem;
+  border-bottom: 1px solid #2A3244;
+  padding-bottom: 0.35rem;
+}
+
+@media (min-width: 640px) {
+  .medhavi-prose h2 {
+    font-size: 1.38rem;
+  }
+}
+
+.light-mode .medhavi-prose h1,
+.light-mode .medhavi-prose h2,
+.light-mode .medhavi-prose h3,
+.light-mode .medhavi-prose h4 {
+  color: #0B2559;
+}
+
+.light-mode .medhavi-prose h2 {
+  border-bottom: 1px solid #0B2559;
+}
+
+.medhavi-prose p {
+  line-height: 1.72;
+  margin-bottom: 0.9rem;
+}
+
+.light-mode .medhavi-prose p {
+  color: #0A0A0A;
+}
+
+.medhavi-prose ul,
+.medhavi-prose ol {
+  padding-left: 1.25rem;
+  margin-bottom: 0.95rem;
+}
+
+.medhavi-prose ul {
+  list-style-type: disc;
+}
+
+.medhavi-prose ol {
+  list-style-type: decimal;
+}
+
+.medhavi-prose li {
+  margin-bottom: 0.35rem;
+  line-height: 1.65;
+}
+
+.light-mode .medhavi-prose li {
+  color: #0A0A0A;
+}
+
+.light-mode .medhavi-prose strong {
+  color: #0B2559;
+}
+
+.medhavi-prose pre {
+  background: #0A0D14;
+  border: 1px solid #2A3244;
+  border-radius: 0.5rem;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+  margin-bottom: 1rem;
+  font-size: 0.82rem;
+  color: #F4F4F0;
+}
+
+.light-mode .medhavi-prose pre {
+  background: #F8F8F6;
+  border: 1px solid #DCDFE6;
+  color: #0A0A0A;
+}
+
+.medhavi-prose code:not(pre code) {
+  background: #1B2232;
+  color: #F4F4F0;
+  padding: 0.12rem 0.38rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.light-mode .medhavi-prose code:not(pre code) {
+  background: #F8F8F6;
+  color: #0B2559;
+  border: 1px solid #DCDFE6;
+  font-weight: 600;
+}
+
+.medhavi-prose table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (min-width: 640px) {
+  .medhavi-prose table {
+    display: table;
+    font-size: 0.9rem;
+  }
+}
+
+.medhavi-prose th,
+.medhavi-prose td {
+  border: 1px solid #2A3244;
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+}
+
+.medhavi-prose th {
+  background: #1B2232;
+  font-weight: 700;
+}
+
+.light-mode .medhavi-prose th {
+  background: #0B2559;
+  color: #FFFFFF;
+  border: 1px solid #0B2559;
+}
+
+.light-mode .medhavi-prose td {
+  border: 1px solid #DCDFE6;
+  color: #0A0A0A;
+}
+
+.medhavi-prose blockquote {
+  border: 1px solid #2A3244;
+  background: #111622;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  margin: 0.9rem 0;
+  font-style: italic;
+}
+
+.light-mode .medhavi-prose blockquote {
+  border: 1px solid #0B2559;
+  background: #F8F8F6;
+  color: #0A0A0A;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Professional Academic Print Layout */
+@media print {
+  body {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  .print-container {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+  .test-studio-vault,
+  .medhavi-security-shield {
+    display: none !important;
+  }
+}
+
+/* Medhavi ICSE Assessment Security Shield */
+.no-select {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  -moz-user-select: none !important;
+  -ms-user-select: none !important;
+  -webkit-touch-callout: none !important;
+}
+
+.medhavi-security-shield {
+  cursor: default;
+  position: relative;
+  overflow: hidden;
+}
+
+.medhavi-security-shield * {
+  pointer-events: none !important;
+}
+
+.medhavi-security-locked {
+  filter: blur(12px) grayscale(1);
+  opacity: 0.35;
+  pointer-events: none !important;
+  transition: all 0.5s ease;
+}
+
+.medhavi-security-locked::after {
+  content: "SECURITY PURGED";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 50;
+  background: #D9483B;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: 14px;
+  letter-spacing: 2px;
+  pointer-events: auto !important;
+  opacity: 1 !important;
+  filter: none !important;
+}
