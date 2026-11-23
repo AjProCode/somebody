@@ -135,10 +135,18 @@ export const MedhaviSpecsModal: React.FC<SpecsModalProps> = ({
                 <ShieldCheck className="w-4 h-4 text-emerald-500 shrink-0" />
                 <div>
                   <div className={`text-xs font-bold ${isLight ? 'text-emerald-900' : 'text-emerald-300'}`}>
-                    Hardcoded ICSE Constitution (116 Rules)
+                    Medhavi Intelligence &amp; Pedagogy Manual (66 Protocols)
                   </div>
                   <div className={`text-[11px] font-mono ${isLight ? 'text-emerald-800' : 'text-slate-400'}`}>
-                    Locked &amp; Active
+                    Locked &amp; Active · Rules 1–9 Core ·{' '}
+                    <a
+                      href="/assets/aistudio/Jaipuria_Medhavi_Complete_Intelligence_Manual_50plus_pages_d362d19f.pdf"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline font-semibold hover:opacity-80 whitespace-nowrap inline-block"
+                    >
+                      Source PDF (75p)
+                    </a>
                   </div>
                 </div>
               </div>

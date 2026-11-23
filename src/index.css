@@ -3,14 +3,15 @@
 
 @layer base {
   :root {
-    --font-display: 'Outfit', 'Noto Sans Devanagari', sans-serif;
+    --font-display: 'Space Grotesk', 'Noto Sans Devanagari', sans-serif;
+    --font-serif: 'Instrument Serif', Georgia, serif;
     --font-sans: 'Plus Jakarta Sans', 'Noto Sans Devanagari', sans-serif;
     --font-mono: 'JetBrains Mono', 'Noto Sans Devanagari', monospace;
     --jaipuria-navy: #0B2559;
     --ink-black: #0A0A0A;
-    --off-white: #F8F8F6;
+    --off-white: #FFFFFF;
     --surface-white: #FFFFFF;
-    --hairline-light: #DCDFE6;
+    --hairline-light: #E5E7EB;
   }
 
   html,
@@ -27,6 +28,10 @@
   h4,
   .font-display {
     font-family: var(--font-display);
+  }
+
+  .font-serif-editorial {
+    font-family: var(--font-serif);
   }
 
   code,
@@ -90,7 +95,7 @@
  * ========================================================================== */
 .editorial-surface {
   background-color: #FFFFFF;
-  border: 1px solid #0B2559;
+  border: 1px solid #E5E7EB;
 }
 
 .dark .editorial-surface {
@@ -99,8 +104,8 @@
 }
 
 .editorial-panel {
-  background-color: #F8F8F6;
-  border: 1px solid #DCDFE6;
+  background-color: #FFFFFF;
+  border: 1px solid #E5E7EB;
 }
 
 .dark .editorial-panel {
@@ -110,7 +115,7 @@
 
 .block-card {
   background-color: #FFFFFF;
-  border: 1px solid #DCDFE6;
+  border: 1px solid #E5E7EB;
 }
 
 .dark .block-card {
@@ -119,13 +124,44 @@
 }
 
 body.light-mode {
-  background-color: #F8F8F6;
+  background-color: #FFFFFF;
   color: #0A0A0A;
 }
 
 body:not(.light-mode) {
   background-color: #0A0D14;
   color: #F4F4F0;
+}
+
+.bg-architectural-grid {
+  background-color: #FFFFFF;
+  background-image:
+    linear-gradient(to right, rgba(11, 37, 89, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(11, 37, 89, 0.055) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: top center;
+}
+
+.dark .bg-architectural-grid {
+  background-color: #0A0D14;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: top center;
+}
+
+.grid-tile-interactive {
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.grid-tile-interactive:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(11, 37, 89, 0.07);
+}
+
+.dark .grid-tile-interactive:hover {
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
 }
 
 /* ============================================================================
@@ -150,20 +186,20 @@ body:not(.light-mode) {
 .medhavi-prose h4 {
   font-family: var(--font-display);
   font-weight: 700;
-  letter-spacing: -0.02em;
-  margin-top: 1.4rem;
-  margin-bottom: 0.6rem;
+  letter-spacing: -0.03em;
+  margin-top: 1.5rem;
+  margin-bottom: 0.65rem;
 }
 
 .medhavi-prose h2 {
-  font-size: 1.25rem;
-  border-bottom: 1px solid #2A3244;
-  padding-bottom: 0.35rem;
+  font-size: 1.3rem;
+  border-bottom: 2px solid #2A3244;
+  padding-bottom: 0.4rem;
 }
 
 @media (min-width: 640px) {
   .medhavi-prose h2 {
-    font-size: 1.38rem;
+    font-size: 1.45rem;
   }
 }
 
@@ -171,11 +207,12 @@ body:not(.light-mode) {
 .light-mode .medhavi-prose h2,
 .light-mode .medhavi-prose h3,
 .light-mode .medhavi-prose h4 {
-  color: #0B2559;
+  color: #0A0A0A;
 }
 
 .light-mode .medhavi-prose h2 {
-  border-bottom: 1px solid #0B2559;
+  color: #0B2559;
+  border-bottom: 2px solid #0B2559;
 }
 
 .medhavi-prose p {
@@ -228,8 +265,8 @@ body:not(.light-mode) {
 }
 
 .light-mode .medhavi-prose pre {
-  background: #F8F8F6;
-  border: 1px solid #DCDFE6;
+  background: #FFFFFF;
+  border: 1px solid #E5E7EB;
   color: #0A0A0A;
 }
 
@@ -243,9 +280,9 @@ body:not(.light-mode) {
 }
 
 .light-mode .medhavi-prose code:not(pre code) {
-  background: #F8F8F6;
+  background: #F9FAFB;
   color: #0B2559;
-  border: 1px solid #DCDFE6;
+  border: 1px solid #E5E7EB;
   font-weight: 600;
 }
 
@@ -286,7 +323,7 @@ body:not(.light-mode) {
 }
 
 .light-mode .medhavi-prose td {
-  border: 1px solid #DCDFE6;
+  border: 1px solid #E5E7EB;
   color: #0A0A0A;
 }
 
@@ -300,8 +337,8 @@ body:not(.light-mode) {
 }
 
 .light-mode .medhavi-prose blockquote {
-  border: 1px solid #0B2559;
-  background: #F8F8F6;
+  border: 1px solid #D1D5DB;
+  background: #F8FAFC;
   color: #0A0A0A;
 }
 

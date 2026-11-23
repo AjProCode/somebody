@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Zap,
   BookOpen,
@@ -8,26 +8,105 @@ import {
   Clock,
   Layers,
   HelpCircle,
-  Lightbulb
+  Lightbulb,
+  Loader2
 } from 'lucide-react';
+import {
+  type CustomSpecItem,
+  type IdVerificationResult,
+  type IntelligenceMode
+} from '../utils/medhaviEngine';
+import { inferGrade7Subject } from '../data/grade7Textbooks';
+import { executeStudioWorkflow, type StudioExecutionResult } from '../utils/studioRunner';
+import { StudioOutputPanel } from './StudioOutputPanel';
+import { StudioHistoryPanel } from './StudioHistoryPanel';
+import {
+  clearStudioHistory,
+  deleteStudioHistoryEntry,
+  loadStudioHistory,
+  saveStudioHistoryEntry,
+  STUDIO_HISTORY_EVENT,
+  type StudioHistoryEntry
+} from '../utils/studioHistory';
 
 interface StudentRevisionDashboardProps {
   isLight: boolean;
   activeSubject: string;
-  onGeneratePrompt: (prompt: string, workflowType?: string) => void;
+  verifiedIdentity: IdVerificationResult | null;
+  selectedModel: string;
+  customSpecs: CustomSpecItem[];
+  intelligenceMode: IntelligenceMode;
+  initialHistoryEntry?: StudioHistoryEntry | null;
+  onStudioEntrySaved?: (entry: StudioHistoryEntry) => void;
+  onStudioEntryDeleted?: (id: string) => void;
+  onStudioHistoryCleared?: (removedIds: string[]) => void;
   onShowToast: (message: string, type?: 'info' | 'error' | 'success') => void;
 }
 
 export const StudentRevisionDashboard: React.FC<StudentRevisionDashboardProps> = ({
   isLight,
   activeSubject,
-  onGeneratePrompt,
+  verifiedIdentity,
+  selectedModel,
+  customSpecs,
+  intelligenceMode,
+  initialHistoryEntry = null,
+  onStudioEntrySaved,
+  onStudioEntryDeleted,
+  onStudioHistoryCleared,
   onShowToast
 }) => {
   const [topic, setTopic] = useState('');
   const [focusArea, setFocusArea] = useState<'formulas_theorems' | 'common_pitfalls' | 'complete_summary' | 'rapid_mcqs'>(
     'complete_summary'
   );
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [studioResult, setStudioResult] = useState<StudioExecutionResult | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  const [generatedTitle, setGeneratedTitle] = useState('');
+  const [historyEntries, setHistoryEntries] = useState<StudioHistoryEntry[]>(() =>
+    loadStudioHistory('revision', 'student')
+  );
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshHistory = useCallback(() => {
+    setHistoryEntries(loadStudioHistory('revision', 'student'));
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
+    window.addEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+    return () => window.removeEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+  }, [refreshHistory]);
+
+  const restoreFromHistory = useCallback((entry: StudioHistoryEntry, scrollToOutput = true) => {
+    const snap = entry.inputsSnapshot || {};
+    if (typeof snap.topic === 'string') setTopic(snap.topic);
+    if (
+      snap.focusArea === 'formulas_theorems' ||
+      snap.focusArea === 'common_pitfalls' ||
+      snap.focusArea === 'complete_summary' ||
+      snap.focusArea === 'rapid_mcqs'
+    ) {
+      setFocusArea(snap.focusArea);
+    }
+    setGeneratedTitle(entry.title);
+    setStreamingText('');
+    setStudioError(null);
+    setStudioResult(entry.result);
+    setActiveHistoryId(entry.id);
+    if (scrollToOutput) {
+      setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (initialHistoryEntry && initialHistoryEntry.studioId === 'revision') {
+      restoreFromHistory(initialHistoryEntry, true);
+    }
+  }, [initialHistoryEntry, restoreFromHistory]);
 
   const focusDescriptions = {
     complete_summary: {
@@ -48,12 +127,14 @@ export const StudentRevisionDashboard: React.FC<StudentRevisionDashboardProps> =
     }
   };
 
-  const handleGenerate = () => {
-    const cleanTopic = topic.trim() || `Class 7 ${activeSubject} Core Revision`;
+  const handleGenerate = async () => {
+    if (isGenerating) return;
+    const inferredSubject = inferGrade7Subject(topic) || activeSubject;
+    const cleanTopic = topic.trim() || `Class 7 ${inferredSubject} Core Revision`;
     const focus = focusDescriptions[focusArea];
 
     const prompt = `[5-MINUTE ICSE EXAM MASTERY REVISION STUDIO]
-Create a concise, high-yield 5-Minute ICSE Exam Revision Card for Class 7 in ${activeSubject}:
+Create a concise, high-yield 5-Minute ICSE Exam Revision Card for Class 7 in ${inferredSubject}:
 - Board: ICSE (CISCE) ONLY
 - Chapter/Topic: "${cleanTopic}"
 - Focus: ${focus.name} (${focus.desc})
@@ -66,12 +147,55 @@ Structure the revision sheet into 4 sharp, high-retention sections:
 2. **Key Formulas, Symbols & SI Units**:
    - Clean Markdown summary table of all variables, symbols, and units.
 3. **🚨 Top 3 Class 7 Exam Pitfalls (Don't Lose Marks Here!)**:
-   - The 3 exact conceptual mistakes students commonly make in ${activeSubject} exams and the quick memory check to avoid them.
+   - The 3 exact conceptual mistakes students commonly make in ${inferredSubject} exams and the quick memory check to avoid them.
 4. **💡 Medhavi 30-Second Practice Problem**:
-   - One high-probability exam question worked out step-by-step with the final answer highlighted.`;
+   - One high-probability exam question with step-by-step solving guidance.`;
 
-    onGeneratePrompt(prompt, 'exam_revision');
+    setGeneratedTitle(cleanTopic);
+    setIsGenerating(true);
+    setStreamingText('');
+    setStudioResult(null);
+    setStudioError(null);
     onShowToast(`Generating 5-minute revision card for "${cleanTopic}"...`, 'info');
+    setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+
+    try {
+      const result = await executeStudioWorkflow({
+        prompt,
+        role: 'student',
+        subject: inferredSubject,
+        workflowType: 'exam_revision',
+        verifiedIdentity,
+        selectedModel,
+        customSpecs,
+        intelligenceMode,
+        onDelta: (partial) => setStreamingText(partial)
+      });
+      setStudioResult(result);
+      const saved = saveStudioHistoryEntry({
+        studioId: 'revision',
+        role: 'student',
+        ownerId: verifiedIdentity?.schoolId || 'scholar',
+        title: cleanTopic,
+        subtitle: focus.name,
+        subject: inferredSubject,
+        inputsSnapshot: {
+          topic: cleanTopic,
+          focusArea
+        },
+        result
+      });
+      setActiveHistoryId(saved.id);
+      refreshHistory();
+      onStudioEntrySaved?.(saved);
+      onShowToast('5-Minute Revision Card saved to 5-Min Revision History.', 'success');
+    } catch (err: any) {
+      const msg = err?.message || 'Revision card generation failed.';
+      setStudioError(msg);
+      onShowToast(msg, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   return (
@@ -93,19 +217,49 @@ Structure the revision sheet into 4 sharp, high-retention sections:
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => window.print()}
-          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
-            isLight
-              ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
-              : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
-          }`}
-        >
-          <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
-          <span>Print Card</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+              isLight
+                ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
+                : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
+            }`}
+          >
+            <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
+            <span>Print Card</span>
+          </button>
+        </div>
       </div>
+
+      <StudioHistoryPanel
+        isLight={isLight}
+        studioName="5-Minute Revision"
+        entries={historyEntries}
+        activeEntryId={activeHistoryId}
+        emptyHint="No 5-minute revision cards generated yet. Formula sheets and chapter flash summaries save here automatically."
+        onSelectEntry={(entry) => {
+          restoreFromHistory(entry, true);
+          onShowToast(`Loaded revision card "${entry.title}" inside studio.`, 'info');
+        }}
+        onDeleteEntry={(id) => {
+          deleteStudioHistoryEntry(id);
+          if (activeHistoryId === id) {
+            setActiveHistoryId(null);
+          }
+          refreshHistory();
+          onStudioEntryDeleted?.(id);
+          onShowToast('Removed revision card from studio history.', 'info');
+        }}
+        onClearAll={() => {
+          const removed = clearStudioHistory('revision', 'student');
+          setActiveHistoryId(null);
+          refreshHistory();
+          onStudioHistoryCleared?.(removed.map((r) => r.id));
+          onShowToast('Cleared 5-Minute Revision history.', 'info');
+        }}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Cols: Controls */}
@@ -175,11 +329,20 @@ Structure the revision sheet into 4 sharp, high-retention sections:
             {/* Generate Action Button */}
             <button
               type="button"
+              disabled={isGenerating}
               onClick={handleGenerate}
-              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] transition-colors cursor-pointer"
+              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] disabled:opacity-60 transition-colors cursor-pointer"
             >
-              <Zap className="w-4 h-4 fill-current" />
-              <span>Generate 5-Minute Class 7 Revision Card</span>
+              {isGenerating ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Zap className="w-4 h-4 fill-current" />
+              )}
+              <span>
+                {isGenerating
+                  ? 'Building Revision Card Inside Studio…'
+                  : 'Generate 5-Minute Class 7 Revision Card'}
+              </span>
             </button>
           </div>
         </div>
@@ -218,10 +381,30 @@ Structure the revision sheet into 4 sharp, high-retention sections:
               isLight ? 'border-slate-200 text-slate-600' : 'border-slate-800 text-slate-400'
             }`}>
               <HelpCircle className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-              <span>Revision cards are saved in your chat session and can be printed as wallet-sized study slips.</span>
+              <span>Revision cards render right inside this studio and print cleanly as wallet-sized study slips.</span>
             </div>
           </div>
         </div>
+      </div>
+
+      <div ref={outputRef}>
+        <StudioOutputPanel
+          isLight={isLight}
+          title={generatedTitle || '5-Minute Class 7 Revision Card'}
+          subtitle={`${focusDescriptions[focusArea].name} · Instant Study Sheet`}
+          isGenerating={isGenerating}
+          streamingText={streamingText}
+          result={studioResult}
+          error={studioError}
+          copyLabel="Copy Card"
+          onClear={() => {
+            setStreamingText('');
+            setStudioResult(null);
+            setStudioError(null);
+            setActiveHistoryId(null);
+          }}
+          onShowToast={onShowToast}
+        />
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Award,
   CheckCircle2,
@@ -11,21 +11,53 @@ import {
   Copy,
   Check,
   HelpCircle,
-  Paperclip
+  Paperclip,
+  Loader2
 } from 'lucide-react';
-import { LOCKED_GRADE } from '../utils/medhaviEngine';
+import {
+  parseMedhaviResponse,
+  type CustomSpecItem,
+  type IdVerificationResult,
+  type IntelligenceMode
+} from '../utils/medhaviEngine';
+import { inferGrade7Subject } from '../data/grade7Textbooks';
+import { executeStudioWorkflow, type StudioExecutionResult } from '../utils/studioRunner';
+import { StudioOutputPanel } from './StudioOutputPanel';
+import { StudioHistoryPanel } from './StudioHistoryPanel';
+import {
+  clearStudioHistory,
+  deleteStudioHistoryEntry,
+  loadStudioHistory,
+  saveStudioHistoryEntry,
+  STUDIO_HISTORY_EVENT,
+  type StudioHistoryEntry
+} from '../utils/studioHistory';
 
 interface TeacherEvaluationDashboardProps {
   isLight: boolean;
   activeSubject: string;
-  onGeneratePrompt: (prompt: string, workflowType?: string) => void;
+  verifiedIdentity: IdVerificationResult | null;
+  selectedModel: string;
+  customSpecs: CustomSpecItem[];
+  intelligenceMode: IntelligenceMode;
+  initialHistoryEntry?: StudioHistoryEntry | null;
+  onStudioEntrySaved?: (entry: StudioHistoryEntry) => void;
+  onStudioEntryDeleted?: (id: string) => void;
+  onStudioHistoryCleared?: (removedIds: string[]) => void;
   onShowToast: (message: string, type?: 'info' | 'error' | 'success') => void;
 }
 
 export const TeacherEvaluationDashboard: React.FC<TeacherEvaluationDashboardProps> = ({
   isLight,
   activeSubject,
-  onGeneratePrompt,
+  verifiedIdentity,
+  selectedModel,
+  customSpecs,
+  intelligenceMode,
+  initialHistoryEntry = null,
+  onStudioEntrySaved,
+  onStudioEntryDeleted,
+  onStudioHistoryCleared,
   onShowToast
 }) => {
   const [questionPrompt, setQuestionPrompt] = useState('');
@@ -34,7 +66,54 @@ export const TeacherEvaluationDashboard: React.FC<TeacherEvaluationDashboardProp
   const [studentSubmission, setStudentSubmission] = useState('');
   const [attachedPhoto, setAttachedPhoto] = useState<string | null>(null);
   const [photoName, setPhotoName] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [studioResult, setStudioResult] = useState<StudioExecutionResult | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  const [lastEvalSubject, setLastEvalSubject] = useState(activeSubject);
+  const [historyEntries, setHistoryEntries] = useState<StudioHistoryEntry[]>(() =>
+    loadStudioHistory('evaluator', 'teacher')
+  );
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshHistory = useCallback(() => {
+    setHistoryEntries(loadStudioHistory('evaluator', 'teacher'));
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
+    window.addEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+    return () => window.removeEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+  }, [refreshHistory]);
+
+  const restoreFromHistory = useCallback(
+    (entry: StudioHistoryEntry, scrollToOutput = true) => {
+      const snap = entry.inputsSnapshot || {};
+      if (typeof snap.questionPrompt === 'string') setQuestionPrompt(snap.questionPrompt);
+      if (typeof snap.maxMarks === 'number') setMaxMarks(snap.maxMarks);
+      if (typeof snap.modelAnswer === 'string') setModelAnswer(snap.modelAnswer);
+      if (typeof snap.studentSubmission === 'string') setStudentSubmission(snap.studentSubmission);
+      setAttachedPhoto(null);
+      setPhotoName('');
+      setLastEvalSubject(entry.subject || activeSubject);
+      setStreamingText('');
+      setStudioError(null);
+      setStudioResult(entry.result);
+      setActiveHistoryId(entry.id);
+      if (scrollToOutput) {
+        setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+      }
+    },
+    [activeSubject]
+  );
+
+  useEffect(() => {
+    if (initialHistoryEntry && initialHistoryEntry.studioId === 'evaluator') {
+      restoreFromHistory(initialHistoryEntry, true);
+    }
+  }, [initialHistoryEntry, restoreFromHistory]);
 
   const sampleProblems = [
     {
@@ -74,7 +153,8 @@ export const TeacherEvaluationDashboard: React.FC<TeacherEvaluationDashboardProp
     reader.readAsDataURL(file);
   };
 
-  const handleEvaluate = () => {
+  const handleEvaluate = async () => {
+    if (isGenerating) return;
     const cleanQ = questionPrompt.trim();
     const cleanSub = studentSubmission.trim();
 
@@ -87,10 +167,13 @@ export const TeacherEvaluationDashboard: React.FC<TeacherEvaluationDashboardProp
       return;
     }
 
+    const inferredSubject = inferGrade7Subject(`${cleanQ} ${cleanSub}`) || activeSubject;
+    setLastEvalSubject(inferredSubject);
+
     const prompt = `[TEACHER ICSE ANSWER EVALUATION STUDIO]
 Evaluate this ICSE Class 7 student answer submission against Seth M.R. Jaipuria School ICSE (CISCE) step-marking standards:
 - Board: ICSE (CISCE) ONLY
-- Subject: ${activeSubject}
+- Subject: ${inferredSubject}
 - Grade: Class 7 (Strictly Calibrated)
 - Question / Problem: "${cleanQ}"
 - Maximum Marks: ${maxMarks}
@@ -103,7 +186,7 @@ Strictly output your evaluation in this format:
    {
      "suggestedScore": number (out of ${maxMarks}),
      "maxMarks": ${maxMarks},
-     "confidence": "High" | "Medium",
+     "confidence": "High" | "Moderate",
      "rubric": [
        {"criterion": "Concept Accuracy", "score": number, "maxScore": number},
        {"criterion": "Step-by-Step Logic", "score": number, "maxScore": number},
@@ -122,8 +205,57 @@ Strictly output your evaluation in this format:
    - How to achieve full marks (${maxMarks}/${maxMarks})
    - A ready-to-write constructive comment for the student copy.`;
 
-    onGeneratePrompt(prompt, 'answer_evaluator');
-    onShowToast(`Evaluating Class 7 ${activeSubject} response (${maxMarks} marks)...`, 'info');
+    setIsGenerating(true);
+    setStreamingText('');
+    setStudioResult(null);
+    setStudioError(null);
+    onShowToast(`Evaluating Class 7 ${inferredSubject} response (${maxMarks} marks)...`, 'info');
+    setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+
+    try {
+      const result = await executeStudioWorkflow({
+        prompt,
+        role: 'teacher',
+        subject: inferredSubject,
+        workflowType: 'answer_evaluator',
+        verifiedIdentity,
+        selectedModel,
+        customSpecs,
+        intelligenceMode,
+        imageDataUrl: attachedPhoto,
+        onDelta: (partial) => setStreamingText(partial)
+      });
+      setStudioResult(result);
+      const parsedEval = parseMedhaviResponse(result.content || '').evaluationData;
+      const scoreBadge = parsedEval
+        ? `${parsedEval.suggestedScore}/${parsedEval.maxMarks} Marks · ${parsedEval.confidence}`
+        : `${maxMarks} Marks Rubric`;
+      const saved = saveStudioHistoryEntry({
+        studioId: 'evaluator',
+        role: 'teacher',
+        ownerId: verifiedIdentity?.schoolId || 'faculty',
+        title: cleanQ.slice(0, 72),
+        subtitle: scoreBadge,
+        subject: inferredSubject,
+        inputsSnapshot: {
+          questionPrompt: cleanQ,
+          maxMarks,
+          modelAnswer: modelAnswer.trim(),
+          studentSubmission: cleanSub
+        },
+        result
+      });
+      setActiveHistoryId(saved.id);
+      refreshHistory();
+      onStudioEntrySaved?.(saved);
+      onShowToast('Rubric evaluation completed & saved to Evaluator History.', 'success');
+    } catch (err: any) {
+      const msg = err?.message || 'Evaluation failed.';
+      setStudioError(msg);
+      onShowToast(msg, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   return (
@@ -147,7 +279,7 @@ Strictly output your evaluation in this format:
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={() => handleApplySample(sampleProblems[0])}
@@ -162,6 +294,34 @@ Strictly output your evaluation in this format:
           </button>
         </div>
       </div>
+
+      <StudioHistoryPanel
+        isLight={isLight}
+        studioName="Answer Evaluator"
+        entries={historyEntries}
+        activeEntryId={activeHistoryId}
+        emptyHint="No past answer evaluations in this studio yet. Graded submissions and 4-pillar rubrics save here automatically."
+        onSelectEntry={(entry) => {
+          restoreFromHistory(entry, true);
+          onShowToast(`Loaded evaluation "${entry.title}" inside studio.`, 'info');
+        }}
+        onDeleteEntry={(id) => {
+          deleteStudioHistoryEntry(id);
+          if (activeHistoryId === id) {
+            setActiveHistoryId(null);
+          }
+          refreshHistory();
+          onStudioEntryDeleted?.(id);
+          onShowToast('Removed evaluation from Answer Evaluator history.', 'info');
+        }}
+        onClearAll={() => {
+          const removed = clearStudioHistory('evaluator', 'teacher');
+          setActiveHistoryId(null);
+          refreshHistory();
+          onStudioHistoryCleared?.(removed.map((r) => r.id));
+          onShowToast('Cleared Answer Evaluator history.', 'info');
+        }}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Cols: Form Inputs */}
@@ -293,11 +453,16 @@ Strictly output your evaluation in this format:
             {/* Evaluate Button */}
             <button
               type="button"
+              disabled={isGenerating}
               onClick={handleEvaluate}
-              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] transition-colors cursor-pointer"
+              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] disabled:opacity-60 transition-colors cursor-pointer"
             >
-              <Sparkles className="w-4 h-4" />
-              <span>Evaluate Submission &amp; Generate Rubric Scores</span>
+              {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+              <span>
+                {isGenerating
+                  ? 'Evaluating Submission Inside Studio…'
+                  : 'Evaluate Submission & Generate Rubric Scores'}
+              </span>
             </button>
           </div>
         </div>
@@ -349,10 +514,30 @@ Strictly output your evaluation in this format:
               isLight ? 'border-slate-200 text-slate-500' : 'border-slate-800 text-slate-400'
             }`}>
               <HelpCircle className={`w-3.5 h-3.5 shrink-0 ${isLight ? 'text-emerald-600' : 'text-amber-400'}`} />
-              <span>Evaluation result includes interactive score bars and an advisory note: "Teacher review recommended before marks are finalized."</span>
+              <span>Evaluation results, 4-pillar rubric bars, and copybook comments render right inside this studio.</span>
             </div>
           </div>
         </div>
+      </div>
+
+      <div ref={outputRef}>
+        <StudioOutputPanel
+          isLight={isLight}
+          title={`Answer Sheet Evaluation · Class 7 ${lastEvalSubject}`}
+          subtitle={`Max Marks: ${maxMarks} · CISCE 4-Pillar Step-Marking Rubric`}
+          isGenerating={isGenerating}
+          streamingText={streamingText}
+          result={studioResult}
+          error={studioError}
+          copyLabel="Copy Report"
+          onClear={() => {
+            setStreamingText('');
+            setStudioResult(null);
+            setStudioError(null);
+            setActiveHistoryId(null);
+          }}
+          onShowToast={onShowToast}
+        />
       </div>
     </div>
   );

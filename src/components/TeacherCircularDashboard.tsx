@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   FileText,
   Languages,
@@ -8,27 +8,115 @@ import {
   Calendar,
   Building,
   HelpCircle,
-  Mail
+  Mail,
+  Loader2
 } from 'lucide-react';
+import {
+  type CustomSpecItem,
+  type IdVerificationResult,
+  type IntelligenceMode
+} from '../utils/medhaviEngine';
+import { executeStudioWorkflow, type StudioExecutionResult } from '../utils/studioRunner';
+import { StudioOutputPanel } from './StudioOutputPanel';
+import { StudioHistoryPanel } from './StudioHistoryPanel';
+import {
+  clearStudioHistory,
+  deleteStudioHistoryEntry,
+  loadStudioHistory,
+  saveStudioHistoryEntry,
+  STUDIO_HISTORY_EVENT,
+  type StudioHistoryEntry
+} from '../utils/studioHistory';
 
 interface TeacherCircularDashboardProps {
   isLight: boolean;
   activeSubject: string;
-  onGeneratePrompt: (prompt: string, workflowType?: string) => void;
+  verifiedIdentity: IdVerificationResult | null;
+  selectedModel: string;
+  customSpecs: CustomSpecItem[];
+  intelligenceMode: IntelligenceMode;
+  initialHistoryEntry?: StudioHistoryEntry | null;
+  onStudioEntrySaved?: (entry: StudioHistoryEntry) => void;
+  onStudioEntryDeleted?: (id: string) => void;
+  onStudioHistoryCleared?: (removedIds: string[]) => void;
   onShowToast: (message: string, type?: 'info' | 'error' | 'success') => void;
 }
 
 export const TeacherCircularDashboard: React.FC<TeacherCircularDashboardProps> = ({
   isLight,
   activeSubject,
-  onGeneratePrompt,
+  verifiedIdentity,
+  selectedModel,
+  customSpecs,
+  intelligenceMode,
+  initialHistoryEntry = null,
+  onStudioEntrySaved,
+  onStudioEntryDeleted,
+  onStudioHistoryCleared,
   onShowToast
 }) => {
   const [circularType, setCircularType] = useState<'ptm' | 'exam_schedule' | 'revision' | 'project' | 'holiday'>('ptm');
   const [targetAudience, setTargetAudience] = useState<'parents' | 'students' | 'faculty'>('parents');
   const [customSubjectTitle, setCustomSubjectTitle] = useState('');
   const [specificDetails, setSpecificDetails] = useState('');
-  const [refNumber] = useState(() => `SMRJ/2026-27/CIR-${Math.floor(100 + Math.random() * 900)}`);
+  const [refNumber, setRefNumber] = useState(() => `SMRJ/2026-27/CIR-${Math.floor(100 + Math.random() * 900)}`);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [studioResult, setStudioResult] = useState<StudioExecutionResult | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  const [generatedTitle, setGeneratedTitle] = useState('');
+  const [historyEntries, setHistoryEntries] = useState<StudioHistoryEntry[]>(() =>
+    loadStudioHistory('circular', 'teacher')
+  );
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshHistory = useCallback(() => {
+    setHistoryEntries(loadStudioHistory('circular', 'teacher'));
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
+    window.addEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+    return () => window.removeEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+  }, [refreshHistory]);
+
+  const restoreFromHistory = useCallback((entry: StudioHistoryEntry, scrollToOutput = true) => {
+    const snap = entry.inputsSnapshot || {};
+    if (
+      snap.circularType === 'ptm' ||
+      snap.circularType === 'exam_schedule' ||
+      snap.circularType === 'revision' ||
+      snap.circularType === 'project' ||
+      snap.circularType === 'holiday'
+    ) {
+      setCircularType(snap.circularType);
+    }
+    if (
+      snap.targetAudience === 'parents' ||
+      snap.targetAudience === 'students' ||
+      snap.targetAudience === 'faculty'
+    ) {
+      setTargetAudience(snap.targetAudience);
+    }
+    if (typeof snap.customSubjectTitle === 'string') setCustomSubjectTitle(snap.customSubjectTitle);
+    if (typeof snap.specificDetails === 'string') setSpecificDetails(snap.specificDetails);
+    if (typeof snap.refNumber === 'string') setRefNumber(snap.refNumber);
+    setGeneratedTitle(entry.title);
+    setStreamingText('');
+    setStudioError(null);
+    setStudioResult(entry.result);
+    setActiveHistoryId(entry.id);
+    if (scrollToOutput) {
+      setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (initialHistoryEntry && initialHistoryEntry.studioId === 'circular') {
+      restoreFromHistory(initialHistoryEntry, true);
+    }
+  }, [initialHistoryEntry, restoreFromHistory]);
 
   const circularPresets = {
     ptm: {
@@ -59,7 +147,8 @@ export const TeacherCircularDashboard: React.FC<TeacherCircularDashboardProps> =
     setSpecificDetails(circularPresets[key].defaultDetails);
   };
 
-  const handleGenerate = () => {
+  const handleGenerate = async () => {
+    if (isGenerating) return;
     const title = customSubjectTitle.trim() || circularPresets[circularType].title;
     const details = specificDetails.trim() || circularPresets[circularType].defaultDetails;
 
@@ -85,8 +174,60 @@ Format the output strictly as an official school notice with:
 4. **Important Instructions for Parents / Scholars**:
    - Uniform, reporting time, ID card mandate, and portal support.`;
 
-    onGeneratePrompt(prompt, 'parent_circular_generator');
+    setGeneratedTitle(title);
+    setIsGenerating(true);
+    setStreamingText('');
+    setStudioResult(null);
+    setStudioError(null);
     onShowToast(`Drafting bilingual circular: "${title.slice(0, 36)}..."`, 'info');
+    setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+
+    try {
+      const result = await executeStudioWorkflow({
+        prompt,
+        role: 'teacher',
+        subject: activeSubject,
+        workflowType: 'parent_circular_generator',
+        verifiedIdentity,
+        selectedModel,
+        customSpecs,
+        intelligenceMode,
+        onDelta: (partial) => setStreamingText(partial)
+      });
+      setStudioResult(result);
+      const audienceLabel =
+        targetAudience === 'parents'
+          ? 'Parents'
+          : targetAudience === 'students'
+          ? 'Scholars'
+          : 'Faculty';
+      const saved = saveStudioHistoryEntry({
+        studioId: 'circular',
+        role: 'teacher',
+        ownerId: verifiedIdentity?.schoolId || 'faculty',
+        title,
+        subtitle: `Ref: ${refNumber} · ${audienceLabel}`,
+        subject: activeSubject || 'Administration',
+        inputsSnapshot: {
+          circularType,
+          targetAudience,
+          customSubjectTitle: title,
+          specificDetails: details,
+          refNumber
+        },
+        result
+      });
+      setActiveHistoryId(saved.id);
+      refreshHistory();
+      onStudioEntrySaved?.(saved);
+      onShowToast('Bilingual circular saved to Circular Studio History.', 'success');
+    } catch (err: any) {
+      const msg = err?.message || 'Circular drafting failed.';
+      setStudioError(msg);
+      onShowToast(msg, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   return (
@@ -108,19 +249,49 @@ Format the output strictly as an official school notice with:
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => window.print()}
-          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
-            isLight
-              ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
-              : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
-          }`}
-        >
-          <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
-          <span>Print Circular</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+              isLight
+                ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
+                : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
+            }`}
+          >
+            <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
+            <span>Print Circular</span>
+          </button>
+        </div>
       </div>
+
+      <StudioHistoryPanel
+        isLight={isLight}
+        studioName="Bilingual Circular"
+        entries={historyEntries}
+        activeEntryId={activeHistoryId}
+        emptyHint="No bilingual circulars drafted yet. Every English + हिन्दी notice you generate is saved here."
+        onSelectEntry={(entry) => {
+          restoreFromHistory(entry, true);
+          onShowToast(`Loaded circular "${entry.title}" inside studio.`, 'info');
+        }}
+        onDeleteEntry={(id) => {
+          deleteStudioHistoryEntry(id);
+          if (activeHistoryId === id) {
+            setActiveHistoryId(null);
+          }
+          refreshHistory();
+          onStudioEntryDeleted?.(id);
+          onShowToast('Removed circular from Circular Studio history.', 'info');
+        }}
+        onClearAll={() => {
+          const removed = clearStudioHistory('circular', 'teacher');
+          setActiveHistoryId(null);
+          refreshHistory();
+          onStudioHistoryCleared?.(removed.map((r) => r.id));
+          onShowToast('Cleared Circular Studio history.', 'info');
+        }}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Cols: Form Controls */}
@@ -239,11 +410,16 @@ Format the output strictly as an official school notice with:
             {/* Generate Action Button */}
             <button
               type="button"
+              disabled={isGenerating}
               onClick={handleGenerate}
-              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] transition-colors cursor-pointer"
+              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] disabled:opacity-60 transition-colors cursor-pointer"
             >
-              <Sparkles className="w-4 h-4" />
-              <span>Generate Official Bilingual Circular (English + हिन्दी)</span>
+              {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+              <span>
+                {isGenerating
+                  ? 'Drafting Bilingual Circular Inside Studio…'
+                  : 'Generate Official Bilingual Circular (English + हिन्दी)'}
+              </span>
             </button>
           </div>
         </div>
@@ -282,10 +458,30 @@ Format the output strictly as an official school notice with:
               isLight ? 'border-slate-200 text-slate-600' : 'border-slate-800 text-slate-400'
             }`}>
               <HelpCircle className="w-3.5 h-3.5 text-purple-500 shrink-0" />
-              <span>Clicking print produces an institutional letterhead notice ready to display on the school board.</span>
+              <span>Bilingual circulars render right inside this studio and print cleanly onto official school stationery.</span>
             </div>
           </div>
         </div>
+      </div>
+
+      <div ref={outputRef}>
+        <StudioOutputPanel
+          isLight={isLight}
+          title={generatedTitle || 'Bilingual Institutional Circular'}
+          subtitle={`Ref: ${refNumber} · English + हिन्दी Official Draft`}
+          isGenerating={isGenerating}
+          streamingText={streamingText}
+          result={studioResult}
+          error={studioError}
+          copyLabel="Copy Circular"
+          onClear={() => {
+            setStreamingText('');
+            setStudioResult(null);
+            setStudioError(null);
+            setActiveHistoryId(null);
+          }}
+          onShowToast={onShowToast}
+        />
       </div>
     </div>
   );

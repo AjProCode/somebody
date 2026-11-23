@@ -103,12 +103,13 @@ export function renderScholarlyMarkdown(markdown: string): string {
     try {
       const html = katex.renderToString(tex, {
         displayMode: true,
+        output: 'html',
         throwOnError: false,
         strict: 'ignore'
       });
       const idx = mathBlocks.length;
       mathBlocks.push(
-        `<div class="my-3 py-2 px-3 rounded-lg bg-slate-900/40 border border-slate-700/40 overflow-x-auto flex items-center justify-between gap-2"><div>${html}</div></div>`
+        `<div class="my-3.5 py-3 px-4 rounded-xl bg-[#F8FAFC] dark:bg-[#111622] border border-[#E5E7EB] dark:border-[#2A3244] text-[#0A0A0A] dark:text-[#F4F4F0] overflow-x-auto flex items-center justify-center"><div class="min-w-0">${html}</div></div>`
       );
       return `@@MATH_BLOCK_${idx}@@`;
     } catch {
@@ -122,6 +123,7 @@ export function renderScholarlyMarkdown(markdown: string): string {
     try {
       const html = katex.renderToString(tex, {
         displayMode: false,
+        output: 'html',
         throwOnError: false,
         strict: 'ignore'
       });

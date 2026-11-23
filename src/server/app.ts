@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import express, { type Express, type Request } from 'express';
 import dotenv from 'dotenv';
 import {
@@ -10,10 +12,34 @@ import {
   verifyInstitutionalPassword,
   verifyFacultyPasscode,
   isTestGenerationRequest,
+  analyzeStudentExerciseForLeakage,
+  enforceStudentZeroAnswerLeakage,
   type AcademicContext,
   type PersonaRole,
   type IdVerificationResult
 } from '../utils/medhaviEngine.ts';
+import {
+  ensureManualLoaded,
+  consultManualPdfBeforeAnswer,
+  MANUAL_PDF_FILENAME,
+  MANUAL_PDF_RELATIVE_PATH,
+  type ManualReferenceResult
+} from './manualPdfLoader.ts';
+import {
+  GRADE_7_TEXTBOOK_CATALOG,
+  getGrade7BooksGrouped,
+  inferGrade7Subject,
+  searchGrade7TextbookReferences,
+  formatTextbookGroundingBlock,
+  type TextbookSearchMatch
+} from '../data/grade7Textbooks.ts';
+import {
+  performLiveWebSearch,
+  formatWebSearchGroundingBlock,
+  isGeminiSearchConfigured,
+  searchWikimediaPageImages,
+  type LiveWebSearchResult
+} from './webSearchService.ts';
 
 dotenv.config();
 
@@ -161,6 +187,15 @@ function setCachedResponse(key: string, text: string, model: string): void {
   RESPONSE_CACHE.set(key, { text, model, timestamp: Date.now() });
 }
 
+function deduplicateModelLoop(text: string): string {
+  const trimmed = text.trim();
+  const secondLogicIdx = trimmed.indexOf('<medhavi_logic>', 20);
+  if (secondLogicIdx > 0) {
+    return trimmed.slice(0, secondLogicIdx).trim();
+  }
+  return trimmed;
+}
+
 // Server-side 3-Download Limit Ledger per Test ID
 const SERVER_TEST_DOWNLOAD_LEDGER = new Map<string, number>();
 const MAX_SERVER_TEST_DOWNLOADS = 3;
@@ -236,10 +271,48 @@ export const AVAILABLE_MODELS = [
   }
 ];
 
-function buildIcseScholarlyFallback(ctx: AcademicContext, rawPrompt: string): string {
+function formatManualLogicLine(
+  manualRef?: ManualReferenceResult,
+  _textbookRefs?: TextbookSearchMatch[],
+  webSearch?: LiveWebSearchResult | null
+): string {
+  const lines: string[] = [];
+  if (manualRef) {
+    const pagesList = manualRef.referencedPages.join(', ');
+    const protoList = manualRef.referencedProtocols.slice(0, 5).join('; ');
+    lines.push(
+      `- Manual Reference: Consulted ${manualRef.file} (Pages ${pagesList} | Protocols: ${protoList})`
+    );
+  }
+  if (webSearch) {
+    lines.push(
+      webSearch.sources.length > 0
+        ? `- Live Web Search (${webSearch.provider}): Retrieved ${webSearch.sources.length} verified source(s) for "${webSearch.query}"`
+        : `- Live Web Search: Queried "${webSearch.query}" (no external results returned)`
+    );
+  }
+  return lines.length > 0 ? `\n${lines.join('\n')}` : '';
+}
+
+function stripBookReferenceFooters(replyText: string): string {
+  if (!replyText) return replyText;
+  return replyText
+    .replace(/\n{0,3}(?:\*\*|__)?\s*Book(?:\s*&\s*Page)?\s*Reference\s*:?(?:\*\*|__)?[^\n]*$/gim, '')
+    .trim();
+}
+
+function buildIcseScholarlyFallback(
+  ctx: AcademicContext,
+  rawPrompt: string,
+  manualRef?: ManualReferenceResult,
+  textbookRefs?: TextbookSearchMatch[],
+  webSearch?: LiveWebSearchResult | null
+): string {
   const cleanPrompt = rawPrompt.trim();
   const lower = cleanPrompt.toLowerCase();
   const subj = ctx.subject || 'Mathematics';
+  const manualLine = formatManualLogicLine(manualRef, textbookRefs, webSearch);
+  const topBook = textbookRefs && textbookRefs.length > 0 ? textbookRefs[0] : null;
 
   // 1. Revision Quiz Workflow (<medhavi_quiz>)
   if (ctx.workflowType === 'revision_quiz' || lower.includes('<medhavi_quiz>') || lower.includes('revision') || lower.includes('quiz')) {
@@ -248,7 +321,7 @@ function buildIcseScholarlyFallback(ctx: AcademicContext, rawPrompt: string): st
     return `<medhavi_logic>
 - Approach: Calibrated 5-question ICSE (CISCE) Class 7 Revision challenge on ${topic}.
 - Key Steps: Embedded conceptual distractors, multi-step analytical deduction, and +2/-1 scoring rules.
-- Verification: Verified unique single correct option and step-by-step ICSE explanation for each item.
+- Verification: Verified unique single correct option and step-by-step ICSE explanation for each item.${manualLine}
 </medhavi_logic>
 
 Welcome to the **Seth M.R. Jaipuria School ICSE Class 7 Revision Arena**! Each correct answer awards **+2 marks**, and each incorrect choice carries a **-1 negative mark**.
@@ -310,7 +383,7 @@ Welcome to the **Seth M.R. Jaipuria School ICSE Class 7 Revision Arena**! Each c
     return `<medhavi_logic>
 - Approach: Evaluated student submission against ICSE (CISCE) Class 7 step-marking criteria.
 - Key Steps: Assessed Concept Accuracy, Step-by-Step Logical Deduction, SI Units/Notation, and Presentation.
-- Verification: Cross-checked partial credit and provided actionable remediation steps.
+- Verification: Cross-checked partial credit and provided actionable remediation steps.${manualLine}
 </medhavi_logic>
 
 <medhavi_evaluation>
@@ -348,86 +421,127 @@ Welcome to the **Seth M.R. Jaipuria School ICSE Class 7 Revision Arena**! Each c
 - **Advisory Note:** *Teacher review recommended before marks are finalized.*`;
   }
 
-  // 3. Congruence of Triangles specific query
+  // 3. Congruence of Triangles specific query (respecting Student Socratic vs Teacher Studio)
   if (lower.includes('congruence') || lower.includes('triangle')) {
+    const isTeacher = ctx.role === 'teacher';
     return `<medhavi_logic>
-- Approach: Structured ICSE (CISCE) Class 7 Geometry explanation of Congruence of Triangles.
-- Key Steps: Defined superposition principle, detailed all 4 ICSE congruence conditions (SSS, SAS, ASA, RHS), and highlighted why AAA/SSA fail.
-- Verification: Included a worked ICSE Class 7 numerical proof and Socratic concept check.
+- Approach: Structured ICSE Class 7 Geometry explanation of Congruence of Triangles (${isTeacher ? 'Teacher Studio exemplar' : 'Student Portal conceptual guide'}).
+- Key Steps: Defined superposition principle, detailed all 4 ICSE congruence criteria (SSS, SAS, ASA, RHS), and contrasted AAA similarity.
+- Verification: Preserved student reasoning step in Student Portal; full proof included only for Faculty.${manualLine}
 </medhavi_logic>
 
-## 📐 Congruence of Triangles (ICSE Class 7 Mathematics)
+### Congruence of Triangles (ICSE Class 7 Mathematics)
 
-In **ICSE Class 7 Geometry**, two geometric figures are **congruent** (denoted by the symbol **\\(\\cong\\)**) if they have the **exact same shape and the exact same size**. When one triangle is placed over the other (the *Method of Superposition*), they cover each other completely.
+Two geometric figures are **congruent** (\\(\\cong\\)) when they have the **exact same shape and size**—under superposition, one covers the other completely.
 
-If \\(\\Delta ABC \\cong \\Delta PQR\\), then their corresponding vertices, sides, and angles match in that exact order (**CPCTC — Corresponding Parts of Congruent Triangles are Congruent**):
-- **Corresponding Sides:** \\(AB = PQ\\), \\(BC = QR\\), \\(AC = PR\\)
-- **Corresponding Angles:** \\(\\angle A = \\angle P\\), \\(\\angle B = \\angle Q\\), \\(\\angle C = \\angle R\\)
+If \\(\\Delta ABC \\cong \\Delta PQR\\), corresponding vertices, sides, and angles match in order (**CPCTC**):
+- **Sides:** \\(AB = PQ\\), \\(BC = QR\\), \\(AC = PR\\)
+- **Angles:** \\(\\angle A = \\angle P\\), \\(\\angle B = \\angle Q\\), \\(\\angle C = \\angle R\\)
 
----
+| Criterion | Condition Required | Key ICSE Rule |
+| :--- | :--- | :--- |
+| **SSS** | All three corresponding sides equal | Fixes all three angles automatically |
+| **SAS** | Two sides and the **included angle** equal | The equal angle must lie strictly between the two sides |
+| **ASA** *(or AAS)* | Two angles and a corresponding side equal | Angle sum (\\(180^\\circ\\)) determines the third angle |
+| **RHS** | Right angle (\\(90^\\circ\\)), hypotenuse, and one side equal | Applies only to right-angled triangles |
 
-### 🔑 The 4 ICSE Conditions for Congruence of Triangles
+**Why AAA fails:** Equal angles guarantee the same shape (similarity), not the same side lengths (e.g., equilateral triangles of side \\(3\\text{ cm}\\) and \\(8\\text{ cm}\\)).
 
-| Criterion | Full Name | Condition Required | Key ICSE Rule to Remember |
-| :--- | :--- | :--- | :--- |
-| **1. SSS** | **Side–Side–Side** | All three sides of one triangle equal the three corresponding sides of the other. | Automatically fixes all three angles. |
-| **2. SAS** | **Side–Angle–Side** | Two sides and the **included angle** of one triangle equal two sides and the **included angle** of the other. | The equal angle **must** lie strictly between the two equal sides. |
-| **3. ASA** *(or AAS)* | **Angle–Side–Angle** | Two angles and the **included side** equal two corresponding angles and the included side of the other. | Since angles sum to \\(180^\\circ\\), knowing two angles fixes the third. |
-| **4. RHS** | **Right Angle–Hypotenuse–Side** | In two right-angled triangles, the **hypotenuse** and **one side** equal the hypotenuse and corresponding side of the other. | Applies **only** to right-angled (\\(90^\\circ\\)) triangles. |
-
----
-
-### 🚨 Common ICSE Class 7 Exam Trap: Why AAA is NOT a Congruence Rule
-Having three equal angles (**AAA**) guarantees the triangles have the **same shape** (similar), but **not necessarily the same size**—for example, a small equilateral triangle of side \\(3\\text{ cm}\\) and a large equilateral triangle of side \\(8\\text{ cm}\\) both have angles of \\(60^\\circ, 60^\\circ, 60^\\circ\\), yet they are not congruent!
-
----
-
-### ✏️ Worked ICSE Example
-**Question:** In \\(\\Delta ABD\\) and \\(\\Delta ACD\\), \\(AB = AC\\) and \\(AD \\perp BC\\). Prove that \\(\\Delta ABD \\cong \\Delta ACD\\).
-
-**Step-by-Step ICSE Proof:**
-1. In right-angled triangles \\(\\Delta ABD\\) and \\(\\Delta ACD\\):
-   - \\(\\angle ADB = \\angle ADC = 90^\\circ\\) *(since \\(AD \\perp BC\\))*
-   - \\(AB = AC\\) *(Given: Hypotenuse is equal)*
-   - \\(AD = AD\\) *(Common side to both triangles)*
-2. Therefore, by the **RHS Congruence Criterion**:
-   \\[
-   \\Delta ABD \\cong \\Delta ACD
-   \\]
-3. Hence, by **CPCTC**, \\(BD = CD\\) (meaning \\(AD\\) bisects base \\(BC\\)).
-
----
-
-### 💡 Medhavi Socratic Check
-Suppose in \\(\\Delta XYZ\\) and \\(\\Delta LMN\\), we know \\(XY = LM = 5\\text{ cm}\\), \\(YZ = MN = 7\\text{ cm}\\), and \\(\\angle X = \\angle L = 40^\\circ\\). Can we use **SAS** here? *(Hint: Which vertex lies between sides \\(XY\\) and \\(YZ\\)?)*`;
+${
+  isTeacher
+    ? `**Teacher Exemplar Proof:** In \\(\\Delta ABD\\) and \\(\\Delta ACD\\) with \\(AB = AC\\) and \\(AD \\perp BC\\):
+1. \\(\\angle ADB = \\angle ADC = 90^\\circ\\) *(since \\(AD \\perp BC\\))*
+2. \\(AB = AC\\) *(Given hypotenuse)*
+3. \\(AD = AD\\) *(Common side)*
+Hence \\(\\Delta ABD \\cong \\Delta ACD\\) by **RHS**, so \\(BD = CD\\) by CPCTC.`
+    : `**Check your understanding:** In \\(\\Delta XYZ\\) and \\(\\Delta LMN\\), suppose \\(XY = LM = 5\\text{ cm}\\), \\(YZ = MN = 7\\text{ cm}\\), and \\(\\angle X = \\angle L = 40^\\circ\\). Which angle actually lies between sides \\(XY\\) and \\(YZ\\), and does that allow you to apply SAS here?`
+}`;
   }
 
-  // 4. General ICSE Class 7 Scholarly Response
-  return `<medhavi_logic>
-- Approach: Aligned response strictly to the ICSE (CISCE) Class 7 syllabus for ${subj}.
-- Key Steps: Structured definition, step-by-step analytical breakdown, worked example, and ICSE examination tip.
-- Verification: Confirmed grade-appropriate terminology and mathematical/scientific rigor.
+  // 4. Student Portal Zero Answer Leakage Check (Math, Physics, Science, English & Computers)
+  if (ctx.role === 'student') {
+    const leakageAnalysis = analyzeStudentExerciseForLeakage(cleanPrompt, ctx.subject);
+    if (leakageAnalysis) {
+      const logicWithManual = leakageAnalysis.socraticLogic.replace(
+        '</medhavi_logic>',
+        `${manualLine}\n</medhavi_logic>`
+      );
+      return `${logicWithManual}\n\n${leakageAnalysis.socraticBody}`;
+    }
+  }
+
+  // 5. General ICSE Class 7 Scholarly Response (Role-separated & aligned to Manual Rules 1-9)
+  const looksLikeUnsolvedExercise =
+    ctx.role === 'student' &&
+    (/\b(solve|calculate|find|evaluate|simplify|prove|answer|compute|write my essay|finish)\b/i.test(cleanPrompt) ||
+      /[=+\-*/×÷^]/.test(cleanPrompt));
+
+  if (looksLikeUnsolvedExercise) {
+    return `<medhavi_logic>
+- Approach: Applied Student Portal Zero Answer Leakage & Socratic Contract (Protocols 04 & 20) for ${subj}.
+- Key Steps: Identified underlying principle for ICSE Class 7 ${subj} and preserved the student's solving step without leakage.
+- Verification: Verified no direct final result or over-complete intermediate calculation was disclosed.${manualLine}
 </medhavi_logic>
 
-## ✨ Jaipuria Medhavi · ICSE Class 7 ${subj}
+Let us work through this problem step-by-step so you keep control of the solving:
 
-**Query:** *${cleanPrompt.slice(0, 180)}*
+1. **Identify what is known and unknown:** Separate the given values from the quantity you need to find.
+2. **Choose the governing rule:** State the operation or relationship connecting those quantities before calculating.
 
-### 1. Core ICSE Class 7 Concept & Definition
-In the **ICSE (CISCE) Class 7 ${subj}** curriculum at **Seth M.R. Jaipuria School**, we approach every problem by first identifying the governing principle, stating our known quantities with proper SI units or notation, and reasoning step-by-step before computing the final result.
+What is the first step or operation you think applies here?`;
+  }
 
-### 2. Step-by-Step Logical Breakdown
-1. **Identify Given Principles:** Break the topic into its foundational definitions and laws as prescribed in the ICSE Class 7 syllabus.
-2. **Formulate the Relationship:** Express the rule symbolically or structurally so each step follows logically from the previous one.
-3. **Verify Edge Cases & Units:** Always check dimensional consistency, signs, and standard ICSE presentation conventions.
+  // Live Web Search + ICSE Class 7 Scholarly Synthesis
+  const sections: string[] = [];
 
-### 3. 💡 ICSE Class 7 Exam Tip
-In ICSE assessments, **step-marking** is awarded for:
-- Writing the governing formula, theorem, or law clearly.
-- Showing intermediate substitution steps.
-- Highlighting the final answer with proper units.
+  if (webSearch && (webSearch.summary || webSearch.sources.length > 0)) {
+    sections.push(
+      `### Live Web Research Brief\n\n${
+        webSearch.summary ||
+        webSearch.sources
+          .slice(0, 4)
+          .map((s) => `- **${s.title}** (${s.domain}): ${s.snippet}`)
+          .join('\n')
+      }`
+    );
+  } else if (webSearch && webSearch.note) {
+    sections.push(`> ${webSearch.note}`);
+  }
 
-*Ask a follow-up question on any specific exercise, theorem, or chapter in ICSE Class 7 ${subj} and we will solve it step-by-step!*`;
+  if (topBook && (!subj || subj === 'ICSE Class 7' || topBook.subject.toLowerCase() === subj.toLowerCase())) {
+    const conceptsBullets = topBook.keyConcepts
+      .slice(0, 4)
+      .map((c) => `- ${c}`)
+      .join('\n');
+    const formulasBullets = topBook.formulasOrFacts
+      .slice(0, 3)
+      .map((f) => `- \`${f}\``)
+      .join('\n');
+    sections.push(
+      `### ICSE Class 7 ${topBook.subject} — ${topBook.title}\n\n${topBook.summary}\n\n#### Key Syllabus Principles\n${conceptsBullets}\n\n#### Essential Rules & Formulas\n${formulasBullets}`
+    );
+  } else {
+    sections.push(
+      `### ICSE Class 7 ${subj} — Conceptual Guide\n\nIn **ICSE Class 7 ${subj}**, structure your reasoning around three clear pillars:\n1. **Governing Principle:** Define the law, theorem, or concept accurately with standard CISCE terminology and SI units.\n2. **Causal / Logical Link:** Show why each step follows from the previous one rather than relying on memorised shortcuts.\n3. **Verification:** Check units, signs, boundary conditions, and whether the conclusion answers the exact question asked.`
+    );
+  }
+
+  const closingLine =
+    ctx.role === 'teacher'
+      ? 'Share a specific 40-minute period target, differentiation goal, or assessment marks breakdown to convert this topic into a classroom-ready plan or rubric.'
+      : `Which part of **${topBook && topBook.subject.toLowerCase() === subj.toLowerCase() ? topBook.title : `Class 7 ${subj}`}** would you like to explore or test yourself on next?`;
+
+  return `<medhavi_logic>
+- Approach: Grounded response in ICSE Class 7 ${subj} curriculum standards${
+    webSearch ? ' and live web search results' : ''
+  } (${ctx.role === 'teacher' ? 'Teacher Studio' : 'Student Portal'}).
+- Key Steps: Synthesized core conceptual principles, formulas, and common pitfalls for ${subj}.
+- Verification: Verified alignment with CISCE Class 7 scope and role-separation rules.${manualLine}
+</medhavi_logic>
+
+${sections.join('\n\n')}
+
+${closingLine}`;
 }
 
 type OpenRouterMessageContent =
@@ -498,8 +612,9 @@ export function createApp(): Express {
         "font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net",
         "img-src 'self' data: blob: https:",
         "media-src 'self' data: blob:",
+        "worker-src 'self' blob:",
         "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com",
-        "object-src 'none'",
+        "object-src 'self' blob:",
         "base-uri 'self'"
       ].join('; ')
     );
@@ -541,8 +656,15 @@ export function createApp(): Express {
   let lastOpenRouterDiagnostic = '';
 
   // Health endpoint
-  apiRouter.get('/health', (_req, res) => {
+  apiRouter.get('/health', async (_req, res) => {
     const openRouterKey = getOpenRouterApiKey();
+    let manualIndex = null;
+    try {
+      manualIndex = await ensureManualLoaded();
+    } catch {
+      manualIndex = null;
+    }
+
     res.json({
       status: 'online',
       school: 'Seth M.R. Jaipuria School (SMRJ)',
@@ -562,8 +684,150 @@ export function createApp(): Express {
       openRouterDiagnostic: !openRouterKey
         ? 'OPENROUTER_API_KEY is not configured on the server.'
         : lastOpenRouterDiagnostic,
-      elevenLabsConfigured: Boolean(DEFAULT_ELEVENLABS_KEY)
+      elevenLabsConfigured: Boolean(DEFAULT_ELEVENLABS_KEY),
+      manualPdf: {
+        file: MANUAL_PDF_FILENAME,
+        loaded: Boolean(manualIndex),
+        totalPages: manualIndex?.totalPages || 0,
+        protocolsLoaded: manualIndex?.protocols.length || 0,
+        consultedBeforeEveryAnswer: true
+      },
+      grade7Textbooks: {
+        indexedChapters: GRADE_7_TEXTBOOK_CATALOG.length,
+        alignment: 'ICSE (CISCE) & NCSE / NCERT Class 7 Reference',
+        consultedBeforeEveryAnswer: true
+      },
+      webSearch: {
+        enabled: true,
+        primaryProvider: isGeminiSearchConfigured()
+          ? 'gemini-google-search'
+          : 'live-web-federated'
+      }
     });
+  });
+
+  // Grade 7 ICSE / NCSE Textbook Reference Library Endpoint
+  apiRouter.get('/textbooks', (req, res) => {
+    const subject = req.query.subject ? String(req.query.subject).slice(0, 80) : undefined;
+    const q = req.query.q ? String(req.query.q).slice(0, 300) : '';
+    const limit = Math.min(12, Math.max(1, Number(req.query.limit) || 4));
+
+    if (q.trim()) {
+      const matches = searchGrade7TextbookReferences({ subject, query: q, limit });
+      res.json({
+        grade: LOCKED_GRADE,
+        query: q,
+        subject: subject || 'All',
+        matches
+      });
+      return;
+    }
+
+    res.json({
+      grade: LOCKED_GRADE,
+      alignment: 'ICSE (CISCE) & NCSE / NCERT Class 7 Reference',
+      totalChapters: GRADE_7_TEXTBOOK_CATALOG.length,
+      books: getGrade7BooksGrouped(subject)
+    });
+  });
+
+  // Grade 7 Textbook Educational Diagrams & Open Page Plates Endpoint
+  apiRouter.get('/textbooks/page-images', async (req, res) => {
+    const chapterId = req.query.chapterId ? String(req.query.chapterId).slice(0, 80) : '';
+    const rawQuery = req.query.q ? String(req.query.q).slice(0, 200) : '';
+    const chapter = chapterId
+      ? GRADE_7_TEXTBOOK_CATALOG.find((c) => c.id === chapterId) || null
+      : null;
+
+    const searchTopic =
+      rawQuery.trim() ||
+      (chapter ? `${chapter.title} ${chapter.keywords.slice(0, 3).join(' ')}` : 'ICSE Class 7 science diagram');
+
+    const images = await searchWikimediaPageImages(searchTopic, 4);
+
+    res.json({
+      chapterId: chapter?.id || null,
+      textbook: chapter?.textbook || null,
+      pageRange: chapter?.pageRange || null,
+      manualPdfUrl: '/api/manual/pdf',
+      query: searchTopic,
+      images
+    });
+  });
+
+  // Stream the Actual 75-Page Intelligence & Pedagogy Manual PDF for Page Image Rendering
+  apiRouter.get('/manual/pdf', (_req, res) => {
+    const absPath = path.resolve(process.cwd(), MANUAL_PDF_RELATIVE_PATH);
+    if (!fs.existsSync(absPath)) {
+      res.status(404).json({ error: 'Institutional manual PDF file not found on server.' });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${MANUAL_PDF_FILENAME}"`);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.sendFile(absPath);
+  });
+
+  // Live Web Search Endpoint (Gemini Google Search Grounding + Federated Live Web Fallback)
+  apiRouter.post('/web-search', async (req, res) => {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`websearch:${ip}`, 25, 60_000)) {
+      res.status(429).json({ error: 'Web search rate limit exceeded. Please wait a moment.' });
+      return;
+    }
+
+    const { query = '', subject = '' } = req.body || {};
+    const cleanQuery = String(query).trim().slice(0, 280);
+    if (!cleanQuery) {
+      res.status(400).json({ error: 'Search query is required.' });
+      return;
+    }
+
+    try {
+      const result = await performLiveWebSearch({
+        query: cleanQuery,
+        subject: subject ? String(subject).slice(0, 80) : undefined
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Live web search failed'
+      });
+    }
+  });
+
+  // Live PDF Manual Consultation Inspection Endpoint
+  apiRouter.get('/manual/reference', async (req, res) => {
+    try {
+      const role: PersonaRole = req.query.role === 'teacher' ? 'teacher' : 'student';
+      const subject = String(req.query.subject || 'Mathematics').slice(0, 80);
+      const q = String(req.query.q || 'Explain this ICSE Class 7 concept clearly.').slice(0, 1000);
+      const workflowType = req.query.workflowType ? String(req.query.workflowType).slice(0, 80) : undefined;
+      const isTestStudio = req.query.isTestStudio === 'true';
+
+      const ref = await consultManualPdfBeforeAnswer({
+        role,
+        subject,
+        prompt: q,
+        workflowType,
+        isTestStudio
+      });
+
+      res.json({
+        file: ref.file,
+        totalPages: ref.totalPages,
+        protocolsLoaded: ref.protocolsLoaded,
+        referencedPages: ref.referencedPages,
+        referencedProtocols: ref.referencedProtocols,
+        ...(req.query.full === '1'
+          ? { groundingBlock: ref.groundingBlock }
+          : { groundingPreview: ref.groundingBlock.slice(0, 600) })
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unable to consult Medhavi PDF manual'
+      });
+    }
   });
 
   // Voices endpoint
@@ -958,8 +1222,10 @@ export function createApp(): Express {
       messages = [],
       context = {},
       imageDataUrl = null,
-      verifiedIdentity = null
+      verifiedIdentity = null,
+      webSearchEnabled: bodyWebSearch = false
     } = req.body || {};
+    const webSearchEnabled = Boolean(bodyWebSearch || context?.webSearchEnabled);
 
     // Zero-Trust Role Enforcement: Only allow 'teacher' role if verifiedIdentity holds a valid server HMAC seal
     let enforcedRole: PersonaRole = 'student';
@@ -1012,21 +1278,31 @@ export function createApp(): Express {
       return;
     }
 
+    const userMsgs = messages.filter((m: any) => m && m.role !== 'assistant');
+    const lastUserMsg = String(
+      userMsgs[userMsgs.length - 1]?.content ||
+        'Explain this ICSE Class 7 concept clearly.'
+    );
+    const recentCombinedQuery = userMsgs
+      .slice(-3)
+      .map((m: any) => String(m?.content || ''))
+      .join(' ');
+
+    const resolvedSubject =
+      inferGrade7Subject(lastUserMsg, context.subject) ||
+      inferGrade7Subject(recentCombinedQuery, context.subject) ||
+      'ICSE Class 7';
+
     const academicCtx: AcademicContext = {
       role: enforcedRole,
       grade: LOCKED_GRADE,
-      subject: context.subject || 'Mathematics',
+      subject: resolvedSubject,
       intelligenceMode: context.intelligenceMode || 'pedagogical',
       model: OPENROUTER_MODEL,
       customSpecs: Array.isArray(context.customSpecs) ? context.customSpecs : [],
       workflowType: context.workflowType,
       isTestStudio: isTestStudioContext
     };
-
-    const lastUserMsg = String(
-      messages.filter((m: any) => m && m.role !== 'assistant').pop()?.content ||
-        'Explain this ICSE Class 7 concept clearly.'
-    );
 
     // Zero-Trust Isolation: Teachers CANNOT generate or view any test, worksheet, quiz, or question paper outside the Restricted Test Studio
     if (
@@ -1050,10 +1326,46 @@ export function createApp(): Express {
       return;
     }
 
-    // Check fast LRU cache when no image is attached (never cache Restricted Test Studio papers across general chat)
+    // MANDATORY STEP 1: Consult the attached Jaipuria Medhavi Intelligence Manual PDF BEFORE cache, AI, or fallback
+    const manualRef = await consultManualPdfBeforeAnswer({
+      role: enforcedRole,
+      subject: academicCtx.subject,
+      prompt: lastUserMsg,
+      recentMessages: messages,
+      hasImage: Boolean(imageDataUrl),
+      workflowType: academicCtx.workflowType,
+      isTestStudio: isTestStudioContext
+    });
+    const manualReferenceMeta = {
+      file: manualRef.file,
+      totalPages: manualRef.totalPages,
+      protocolsLoaded: manualRef.protocolsLoaded,
+      referencedPages: manualRef.referencedPages,
+      referencedProtocols: manualRef.referencedProtocols
+    };
+
+    // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog
+    const textbookRefs = searchGrade7TextbookReferences({
+      subject: academicCtx.subject,
+      query: lastUserMsg,
+      limit: 3
+    });
+    const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
+
+    // OPTIONAL LIVE STEP 3: Perform Live Web Search when enabled by user
+    let liveWebSearch: LiveWebSearchResult | null = null;
+    if (webSearchEnabled && !isTestStudioContext) {
+      liveWebSearch = await performLiveWebSearch({
+        query: lastUserMsg,
+        subject: academicCtx.subject
+      });
+    }
+    const webSearchGroundingBlock = formatWebSearchGroundingBlock(liveWebSearch);
+
+    // Check fast LRU cache when no image is attached and live web search is off
     const cacheKey =
-      !imageDataUrl && !isTestStudioContext
-        ? `${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
+      !imageDataUrl && !isTestStudioContext && !webSearchEnabled
+        ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
         : '';
@@ -1069,7 +1381,10 @@ export function createApp(): Express {
             completionTokens: Math.max(48, Math.round(cachedHit.text.length / 4)),
             totalTokens: Math.max(72, Math.round(cachedHit.text.length / 3)),
             model: cachedHit.model,
-            source: 'openrouter-cache'
+            source: 'openrouter-cache',
+            manualReference: manualReferenceMeta,
+            textbookReferences: textbookRefs,
+            webSources: []
           })}\n\n`
         );
         res.end();
@@ -1077,7 +1392,14 @@ export function createApp(): Express {
       }
     }
 
-    const systemPrompt = buildSystemPrompt(academicCtx);
+    const systemPrompt = [
+      buildSystemPrompt(academicCtx),
+      manualRef.groundingBlock,
+      textbookGroundingBlock,
+      webSearchGroundingBlock
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const openRouterKey = getOpenRouterApiKey();
     const orMessages = buildOpenRouterMessages(systemPrompt, messages, imageDataUrl);
 
@@ -1134,8 +1456,19 @@ export function createApp(): Express {
                 const parsed = JSON.parse(payload);
                 const delta = parsed?.choices?.[0]?.delta?.content;
                 if (typeof delta === 'string' && delta.length > 0) {
-                  streamedText += delta;
-                  res.write(`data: ${JSON.stringify({ type: 'delta', content: delta })}\n\n`);
+                  const candidate = streamedText + delta;
+                  // Guard against Nemotron repeating a full second <medhavi_logic> + body loop mid-stream
+                  if (candidate.indexOf('<medhavi_logic>', 20) !== -1) {
+                    const cleanPrefix = deduplicateModelLoop(streamedText);
+                    streamedText = cleanPrefix;
+                    break;
+                  }
+                  streamedText = candidate;
+                  // For Teacher Studio, stream tokens immediately; for Student Portal, buffer until
+                  // the silent Zero Answer Leakage check (Section 3 of Patch) verifies the response.
+                  if (enforcedRole !== 'student') {
+                    res.write(`data: ${JSON.stringify({ type: 'delta', content: delta })}\n\n`);
+                  }
                 }
                 if (parsed?.usage) {
                   completionTokens = parsed.usage.completion_tokens || completionTokens;
@@ -1186,7 +1519,9 @@ export function createApp(): Express {
             const reply = data?.choices?.[0]?.message?.content;
             if (typeof reply === 'string' && reply.trim()) {
               streamedText = reply;
-              res.write(`data: ${JSON.stringify({ type: 'delta', content: reply })}\n\n`);
+              if (enforcedRole !== 'student') {
+                res.write(`data: ${JSON.stringify({ type: 'delta', content: reply })}\n\n`);
+              }
             } else {
               fallbackReason = 'unary_empty_content';
             }
@@ -1206,14 +1541,33 @@ export function createApp(): Express {
       usedFallback = true;
       lastOpenRouterStatus = 'error';
       lastOpenRouterDiagnostic = fallbackReason || 'OpenRouter request returned empty output.';
-      const fallbackReply = buildIcseScholarlyFallback(academicCtx, lastUserMsg);
+      const fallbackReply = stripBookReferenceFooters(
+        enforceStudentZeroAnswerLeakage(
+          lastUserMsg,
+          buildIcseScholarlyFallback(academicCtx, lastUserMsg, manualRef, textbookRefs, liveWebSearch),
+          enforcedRole,
+          academicCtx.subject
+        )
+      );
       streamedText = fallbackReply;
       res.write(`data: ${JSON.stringify({ type: 'delta', content: fallbackReply })}\n\n`);
     } else {
       lastOpenRouterStatus = 'live';
       lastOpenRouterDiagnostic = '';
-      if (cacheKey && streamedText.trim().length > 40) {
-        setCachedResponse(cacheKey, streamedText, OPENROUTER_MODEL);
+      const cleanStreamed = stripBookReferenceFooters(
+        enforceStudentZeroAnswerLeakage(
+          lastUserMsg,
+          deduplicateModelLoop(streamedText),
+          enforcedRole,
+          academicCtx.subject
+        )
+      );
+      streamedText = cleanStreamed;
+      if (enforcedRole === 'student') {
+        res.write(`data: ${JSON.stringify({ type: 'delta', content: cleanStreamed })}\n\n`);
+      }
+      if (cacheKey && cleanStreamed.length > 40) {
+        setCachedResponse(cacheKey, cleanStreamed, OPENROUTER_MODEL);
       }
     }
 
@@ -1224,7 +1578,16 @@ export function createApp(): Express {
         completionTokens: completionTokens || Math.max(48, Math.round(streamedText.length / 4)),
         totalTokens: totalTokens || Math.max(72, Math.round(streamedText.length / 3)),
         model: OPENROUTER_MODEL,
-        source: usedFallback ? 'icse-scholar-fallback' : 'openrouter-live',
+        source: usedFallback
+          ? liveWebSearch && liveWebSearch.sources.length > 0
+            ? 'web-textbook-grounded'
+            : 'icse-scholar-fallback'
+          : 'openrouter-live',
+        manualReference: manualReferenceMeta,
+        textbookReferences: textbookRefs,
+        webSources: liveWebSearch?.sources || [],
+        webSearchProvider: liveWebSearch?.provider || null,
+        webSearchNote: liveWebSearch?.note || null,
         ...(usedFallback && fallbackReason ? { fallbackReason } : {})
       })}\n\n`
     );
@@ -1244,8 +1607,10 @@ export function createApp(): Express {
         messages = [],
         context = {},
         imageDataUrl = null,
-        verifiedIdentity = null
+        verifiedIdentity = null,
+        webSearchEnabled: bodyWebSearch = false
       } = req.body || {};
+      const webSearchEnabled = Boolean(bodyWebSearch || context?.webSearchEnabled);
 
       let enforcedRole: PersonaRole = 'student';
       if (context.role === 'teacher') {
@@ -1264,30 +1629,49 @@ export function createApp(): Express {
         }
       }
 
+      const teacherOnlyWorkflows = [
+        'question_paper_generator',
+        'answer_evaluator',
+        'lesson_plan_architect',
+        'parent_circular_generator'
+      ];
       const isTestStudioContext = Boolean(context.isTestStudio);
-      if (enforcedRole === 'student' && isTestStudioContext) {
+      if (
+        enforcedRole === 'student' &&
+        (isTestStudioContext || teacherOnlyWorkflows.includes(String(context.workflowType || '')))
+      ) {
         res.status(403).json({
           error:
-            'Security Alert: Restricted Test Studio is reserved exclusively for verified Faculty accounts.'
+            'Security Alert: Restricted Studio workflow is reserved exclusively for verified Faculty accounts.'
         });
         return;
       }
 
+      const userMsgs = messages.filter((m: any) => m && m.role !== 'assistant');
+      const lastUserMsg = String(
+        userMsgs[userMsgs.length - 1]?.content ||
+          'Explain this ICSE Class 7 concept clearly.'
+      );
+      const recentCombinedQuery = userMsgs
+        .slice(-3)
+        .map((m: any) => String(m?.content || ''))
+        .join(' ');
+
+      const resolvedSubject =
+        inferGrade7Subject(lastUserMsg, context.subject) ||
+        inferGrade7Subject(recentCombinedQuery, context.subject) ||
+        'ICSE Class 7';
+
       const academicCtx: AcademicContext = {
         role: enforcedRole,
         grade: LOCKED_GRADE,
-        subject: context.subject || 'Mathematics',
+        subject: resolvedSubject,
         intelligenceMode: context.intelligenceMode || 'pedagogical',
         model: OPENROUTER_MODEL,
         customSpecs: Array.isArray(context.customSpecs) ? context.customSpecs : [],
         workflowType: context.workflowType,
         isTestStudio: isTestStudioContext
       };
-
-      const lastUserMsg = String(
-        messages.filter((m: any) => m && m.role !== 'assistant').pop()?.content ||
-          'Explain this ICSE Class 7 concept clearly.'
-      );
 
       if (
         enforcedRole === 'teacher' &&
@@ -1306,8 +1690,44 @@ export function createApp(): Express {
         return;
       }
 
-      const cacheKey = !isTestStudioContext && !imageDataUrl
-        ? `${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
+      // MANDATORY STEP 1: Consult the attached Jaipuria Medhavi Intelligence Manual PDF BEFORE cache, AI, or fallback
+      const manualRef = await consultManualPdfBeforeAnswer({
+        role: enforcedRole,
+        subject: academicCtx.subject,
+        prompt: lastUserMsg,
+        recentMessages: messages,
+        hasImage: Boolean(imageDataUrl),
+        workflowType: academicCtx.workflowType,
+        isTestStudio: isTestStudioContext
+      });
+      const manualReferenceMeta = {
+        file: manualRef.file,
+        totalPages: manualRef.totalPages,
+        protocolsLoaded: manualRef.protocolsLoaded,
+        referencedPages: manualRef.referencedPages,
+        referencedProtocols: manualRef.referencedProtocols
+      };
+
+      // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog
+      const textbookRefs = searchGrade7TextbookReferences({
+        subject: academicCtx.subject,
+        query: lastUserMsg,
+        limit: 3
+      });
+      const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
+
+      // OPTIONAL LIVE STEP 3: Perform Live Web Search when enabled
+      let liveWebSearch: LiveWebSearchResult | null = null;
+      if (webSearchEnabled && !isTestStudioContext) {
+        liveWebSearch = await performLiveWebSearch({
+          query: lastUserMsg,
+          subject: academicCtx.subject
+        });
+      }
+      const webSearchGroundingBlock = formatWebSearchGroundingBlock(liveWebSearch);
+
+      const cacheKey = !isTestStudioContext && !imageDataUrl && !webSearchEnabled
+        ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
         : '';
@@ -1318,13 +1738,23 @@ export function createApp(): Express {
           reply: cachedHit.text,
           reasoningTokens: Math.max(24, Math.round(cachedHit.text.length / 18)),
           model: cachedHit.model,
-          source: 'openrouter-cache'
+          source: 'openrouter-cache',
+          manualReference: manualReferenceMeta,
+          textbookReferences: textbookRefs,
+          webSources: []
         });
         return;
       }
 
       const openRouterKey = getOpenRouterApiKey();
-      const systemPrompt = buildSystemPrompt(academicCtx);
+      const systemPrompt = [
+        buildSystemPrompt(academicCtx),
+        manualRef.groundingBlock,
+        textbookGroundingBlock,
+        webSearchGroundingBlock
+      ]
+        .filter(Boolean)
+        .join('\n\n');
       let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
       if (openRouterKey) {
@@ -1355,14 +1785,27 @@ export function createApp(): Express {
             const data = await upstream.json();
             const reply = data?.choices?.[0]?.message?.content;
             if (typeof reply === 'string' && reply.trim()) {
+              const cleanReply = stripBookReferenceFooters(
+                enforceStudentZeroAnswerLeakage(
+                  lastUserMsg,
+                  deduplicateModelLoop(reply),
+                  enforcedRole,
+                  academicCtx.subject
+                )
+              );
               lastOpenRouterStatus = 'live';
               lastOpenRouterDiagnostic = '';
-              if (cacheKey) setCachedResponse(cacheKey, reply, OPENROUTER_MODEL);
+              if (cacheKey) setCachedResponse(cacheKey, cleanReply, OPENROUTER_MODEL);
               res.json({
-                reply,
-                reasoningTokens: Math.max(24, Math.round(reply.length / 18)),
+                reply: cleanReply,
+                reasoningTokens: Math.max(24, Math.round(cleanReply.length / 18)),
                 model: OPENROUTER_MODEL,
-                source: 'openrouter-live'
+                source: 'openrouter-live',
+                manualReference: manualReferenceMeta,
+                textbookReferences: textbookRefs,
+                webSources: liveWebSearch?.sources || [],
+                webSearchProvider: liveWebSearch?.provider || null,
+                webSearchNote: liveWebSearch?.note || null
               });
               return;
             }
@@ -1376,15 +1819,30 @@ export function createApp(): Express {
         }
       }
 
-      // Guaranteed Resilient ICSE Class 7 Fallback
+      // Guaranteed Resilient ICSE Class 7 Fallback (Textbook + Live Web Grounded)
       lastOpenRouterStatus = 'error';
       lastOpenRouterDiagnostic = fallbackReason || 'OpenRouter API unavailable.';
-      const fallbackReply = buildIcseScholarlyFallback(academicCtx, lastUserMsg);
+      const fallbackReply = stripBookReferenceFooters(
+        enforceStudentZeroAnswerLeakage(
+          lastUserMsg,
+          buildIcseScholarlyFallback(academicCtx, lastUserMsg, manualRef, textbookRefs, liveWebSearch),
+          enforcedRole,
+          academicCtx.subject
+        )
+      );
       res.json({
         reply: fallbackReply,
         reasoningTokens: Math.max(28, Math.round(fallbackReply.length / 18)),
         model: OPENROUTER_MODEL,
-        source: 'icse-scholar-fallback',
+        source:
+          liveWebSearch && liveWebSearch.sources.length > 0
+            ? 'web-textbook-grounded'
+            : 'icse-scholar-fallback',
+        manualReference: manualReferenceMeta,
+        textbookReferences: textbookRefs,
+        webSources: liveWebSearch?.sources || [],
+        webSearchProvider: liveWebSearch?.provider || null,
+        webSearchNote: liveWebSearch?.note || null,
         ...(fallbackReason ? { fallbackReason } : {})
       });
     } catch (err) {

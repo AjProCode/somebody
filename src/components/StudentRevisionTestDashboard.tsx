@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   FileText,
   Zap,
@@ -7,13 +7,41 @@ import {
   CheckCircle2,
   Copy,
   BookOpen,
-  Award
+  Award,
+  Loader2
 } from 'lucide-react';
+import {
+  type CustomSpecItem,
+  type IdVerificationResult,
+  type IntelligenceMode,
+  type QuizData,
+  type RevisionPerformanceReport
+} from '../utils/medhaviEngine';
+import { inferGrade7Subject } from '../data/grade7Textbooks';
+import { executeStudioWorkflow, type StudioExecutionResult } from '../utils/studioRunner';
+import { StudioOutputPanel } from './StudioOutputPanel';
+import { StudioHistoryPanel } from './StudioHistoryPanel';
+import {
+  clearStudioHistory,
+  deleteStudioHistoryEntry,
+  loadStudioHistory,
+  saveStudioHistoryEntry,
+  STUDIO_HISTORY_EVENT,
+  type StudioHistoryEntry
+} from '../utils/studioHistory';
 
 interface StudentRevisionTestDashboardProps {
   isLight: boolean;
   activeSubject: string;
-  onGeneratePrompt: (prompt: string, workflowType?: string) => void;
+  verifiedIdentity: IdVerificationResult | null;
+  selectedModel: string;
+  customSpecs: CustomSpecItem[];
+  intelligenceMode: IntelligenceMode;
+  initialHistoryEntry?: StudioHistoryEntry | null;
+  onStudioEntrySaved?: (entry: StudioHistoryEntry) => void;
+  onStudioEntryDeleted?: (id: string) => void;
+  onStudioHistoryCleared?: (removedIds: string[]) => void;
+  onSaveQuizAttempt?: (report: RevisionPerformanceReport, quiz: QuizData, subject: string) => void;
   onShowToast: (message: string, type?: 'info' | 'error' | 'success') => void;
 }
 
@@ -78,7 +106,15 @@ const SUBJECT_QUICK_DRILLS: Record<string, Array<{ topic: string; badge: string 
 export const StudentRevisionTestDashboard: React.FC<StudentRevisionTestDashboardProps> = ({
   isLight,
   activeSubject,
-  onGeneratePrompt,
+  verifiedIdentity,
+  selectedModel,
+  customSpecs,
+  intelligenceMode,
+  initialHistoryEntry = null,
+  onStudioEntrySaved,
+  onStudioEntryDeleted,
+  onStudioHistoryCleared,
+  onSaveQuizAttempt,
   onShowToast
 }) => {
   const [topic, setTopic] = useState('');
@@ -88,6 +124,68 @@ export const StudentRevisionTestDashboard: React.FC<StudentRevisionTestDashboard
   );
   const [difficulty, setDifficulty] = useState<'Standard' | 'Challenging' | 'Expert'>('Standard');
   const [includeStepHints, setIncludeStepHints] = useState<boolean>(true);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [studioResult, setStudioResult] = useState<StudioExecutionResult | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  const [generatedTopic, setGeneratedTopic] = useState('');
+  const [generatedSubject, setGeneratedSubject] = useState(activeSubject);
+  const [historyEntries, setHistoryEntries] = useState<StudioHistoryEntry[]>(() =>
+    loadStudioHistory('revision_arena', 'student')
+  );
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshHistory = useCallback(() => {
+    setHistoryEntries(loadStudioHistory('revision_arena', 'student'));
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
+    window.addEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+    return () => window.removeEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+  }, [refreshHistory]);
+
+  const restoreFromHistory = useCallback(
+    (entry: StudioHistoryEntry, scrollToOutput = true) => {
+      const snap = entry.inputsSnapshot || {};
+      if (typeof snap.topic === 'string') setTopic(snap.topic);
+      if (typeof snap.questionCount === 'number') setQuestionCount(snap.questionCount);
+      if (
+        snap.format === 'Objective MCQs' ||
+        snap.format === 'Short Answers' ||
+        snap.format === 'Mixed Pattern'
+      ) {
+        setFormat(snap.format);
+      }
+      if (
+        snap.difficulty === 'Standard' ||
+        snap.difficulty === 'Challenging' ||
+        snap.difficulty === 'Expert'
+      ) {
+        setDifficulty(snap.difficulty);
+      }
+      if (typeof snap.includeStepHints === 'boolean') {
+        setIncludeStepHints(snap.includeStepHints);
+      }
+      setGeneratedTopic(entry.title);
+      setGeneratedSubject(entry.subject || activeSubject);
+      setStreamingText('');
+      setStudioError(null);
+      setStudioResult(entry.result);
+      setActiveHistoryId(entry.id);
+      if (scrollToOutput) {
+        setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+      }
+    },
+    [activeSubject]
+  );
+
+  useEffect(() => {
+    if (initialHistoryEntry && initialHistoryEntry.studioId === 'revision_arena') {
+      restoreFromHistory(initialHistoryEntry, true);
+    }
+  }, [initialHistoryEntry, restoreFromHistory]);
 
   const subjectDrills = SUBJECT_QUICK_DRILLS[activeSubject] || SUBJECT_QUICK_DRILLS.Mathematics;
   const estimatedMinutes =
@@ -95,11 +193,20 @@ export const StudentRevisionTestDashboard: React.FC<StudentRevisionTestDashboard
   const estimatedMarks =
     format === 'Objective MCQs' ? questionCount * 2 : Math.round(questionCount * 2.5);
 
-  const handleLaunch = (customTopic?: string) => {
-    const targetTopic = customTopic || topic.trim() || `ICSE Class 7 ${activeSubject} Full Revision`;
+  const runRevisionGeneration = async (
+    customTopic?: string,
+    overrideDifficulty?: QuizData['difficulty']
+  ) => {
+    if (isGenerating) return;
+    const rawTopic = (customTopic || topic).trim();
+    const inferredSubject = inferGrade7Subject(rawTopic) || activeSubject;
+    const targetTopic = rawTopic || `ICSE Class 7 ${inferredSubject} Full Revision`;
+    const activeWorkflow = format === 'Objective MCQs' || overrideDifficulty ? 'revision_quiz' : 'revision_test';
 
-    const prompt = `[STUDENT REVISION TEST GENERATOR — ICSE (CISCE) CLASS 7]
-Generate a complete, student-friendly ICSE Class 7 Revision Test in ${activeSubject}:
+    const prompt = overrideDifficulty
+      ? `Generate a 5-question ${overrideDifficulty}-level Revision Arena MCQ challenge for Class 7 ${inferredSubject} on "${targetTopic}". Return inside <medhavi_quiz>...</medhavi_quiz> tags.`
+      : `[STUDENT REVISION TEST GENERATOR — ICSE (CISCE) CLASS 7]
+Generate a complete, student-friendly ICSE Class 7 Revision Test in ${inferredSubject}:
 - Board: ICSE (CISCE) Strictly
 - Topic: "${targetTopic}"
 - Pattern: ${format}
@@ -115,11 +222,70 @@ ${includeStepHints ? '- Provide concise conceptual hints before the final Self-C
 
 If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_quiz> so I can attempt them interactively with +2 / -1 scoring, and also present readable revision notes.`;
 
-    onGeneratePrompt(prompt, format === 'Objective MCQs' ? 'revision_quiz' : undefined);
+    setGeneratedTopic(targetTopic);
+    setGeneratedSubject(inferredSubject);
+    setIsGenerating(true);
+    setStreamingText('');
+    setStudioResult(null);
+    setStudioError(null);
     onShowToast(
-      `Generating ${questionCount}-question ${difficulty} ICSE revision test on "${targetTopic}"...`,
+      `Generating ${overrideDifficulty ? '5-question interactive' : `${questionCount}-question ${difficulty}`} ICSE revision test on "${targetTopic}"...`,
       'info'
     );
+    setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+
+    try {
+      const result = await executeStudioWorkflow({
+        prompt,
+        role: 'student',
+        subject: inferredSubject,
+        workflowType: activeWorkflow,
+        verifiedIdentity,
+        selectedModel,
+        customSpecs,
+        intelligenceMode,
+        workflowMeta: {
+          topic: targetTopic,
+          difficulty: overrideDifficulty || difficulty,
+          questionCount: overrideDifficulty ? 5 : questionCount
+        },
+        onDelta: (partial) => setStreamingText(partial)
+      });
+      setStudioResult(result);
+      const runDifficulty = overrideDifficulty || difficulty;
+      const runFormat = overrideDifficulty ? 'Objective MCQs' : format;
+      const runCount = overrideDifficulty ? 5 : questionCount;
+      const saved = saveStudioHistoryEntry({
+        studioId: 'revision_arena',
+        role: 'student',
+        ownerId: verifiedIdentity?.schoolId || 'scholar',
+        title: targetTopic,
+        subtitle: `${runFormat} · ${runDifficulty} · ${runCount} Qs`,
+        subject: inferredSubject,
+        inputsSnapshot: {
+          topic: targetTopic,
+          questionCount: runCount,
+          format: runFormat,
+          difficulty: difficulty,
+          includeStepHints
+        },
+        result
+      });
+      setActiveHistoryId(saved.id);
+      refreshHistory();
+      onStudioEntrySaved?.(saved);
+      onShowToast('Revision test ready & saved to Revision Tests History.', 'success');
+    } catch (err: any) {
+      const msg = err?.message || 'Could not generate revision test.';
+      setStudioError(msg);
+      onShowToast(msg, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const handleLaunch = (customTopic?: string) => {
+    void runRevisionGeneration(customTopic);
   };
 
   return (
@@ -133,7 +299,7 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
         <div className="space-y-1.5">
           <div className={`flex items-center gap-2 text-xs font-mono uppercase tracking-wider font-semibold ${isLight ? 'text-[#0B2559]/75' : 'text-[#F5B700]'}`}>
             <BookOpen className="w-3.5 h-3.5 shrink-0 text-[#F5B700]" />
-            <span>Scholar Studio · ICSE Class 7 {activeSubject}</span>
+            <span>Scholar Studio · ICSE Class 7</span>
           </div>
           <h1
             className={`text-2xl sm:text-3xl font-bold font-display ${
@@ -171,6 +337,34 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
         </div>
       </div>
 
+      <StudioHistoryPanel
+        isLight={isLight}
+        studioName="Revision Tests"
+        entries={historyEntries}
+        activeEntryId={activeHistoryId}
+        emptyHint="No revision tests or interactive quizzes generated yet. Every paper and quiz you build here is saved automatically."
+        onSelectEntry={(entry) => {
+          restoreFromHistory(entry, true);
+          onShowToast(`Loaded revision test "${entry.title}" inside studio.`, 'info');
+        }}
+        onDeleteEntry={(id) => {
+          deleteStudioHistoryEntry(id);
+          if (activeHistoryId === id) {
+            setActiveHistoryId(null);
+          }
+          refreshHistory();
+          onStudioEntryDeleted?.(id);
+          onShowToast('Removed revision test from studio history.', 'info');
+        }}
+        onClearAll={() => {
+          const removed = clearStudioHistory('revision_arena', 'student');
+          setActiveHistoryId(null);
+          refreshHistory();
+          onStudioHistoryCleared?.(removed.map((r) => r.id));
+          onShowToast('Cleared Revision Tests history.', 'info');
+        }}
+      />
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Cols: Revision Builder */}
         <div className="lg:col-span-2 space-y-5">
@@ -187,7 +381,7 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
                   isLight ? 'text-slate-600' : 'text-slate-400'
                 }`}
               >
-                {activeSubject} Chapter or Syllabus Topic
+                Chapter or Syllabus Topic
               </label>
               <input
                 id="rev-topic"
@@ -345,11 +539,20 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
             {/* Launch Button */}
             <button
               type="button"
+              disabled={isGenerating}
               onClick={() => handleLaunch()}
-              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] transition-colors cursor-pointer"
+              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] disabled:opacity-60 transition-colors cursor-pointer"
             >
-              <FileText className="w-4 h-4 shrink-0" />
-              <span>Generate ICSE Revision Test ({questionCount} Questions)</span>
+              {isGenerating ? (
+                <Loader2 className="w-4 h-4 shrink-0 animate-spin" />
+              ) : (
+                <FileText className="w-4 h-4 shrink-0" />
+              )}
+              <span>
+                {isGenerating
+                  ? 'Generating Revision Test Inside Studio…'
+                  : `Generate ICSE Revision Test (${questionCount} Questions)`}
+              </span>
             </button>
           </div>
         </div>
@@ -364,7 +567,7 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-mono uppercase tracking-wider text-amber-500 font-bold flex items-center gap-1.5">
                 <Zap className="w-4 h-4 shrink-0" />
-                <span>{activeSubject} Quick Drills</span>
+                <span>Quick Chapter Drills</span>
               </h3>
               <Award className="w-4 h-4 text-amber-500/70" />
             </div>
@@ -386,7 +589,7 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
                       isLight ? 'text-amber-800' : 'text-amber-400'
                     }`}
                   >
-                    <span>{activeSubject}</span>
+                    <span>ICSE Class 7</span>
                     <span
                       className={`px-2 py-0.5 rounded-md border font-semibold ${
                         isLight
@@ -417,11 +620,34 @@ If Pattern is Objective MCQs, wrap the questions in <medhavi_quiz>...</medhavi_q
             >
               <HelpCircle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
               <span>
-                After your revision test is generated in chat, use the <strong>Copy Test</strong> button on the response card to copy questions into your study notes.
+                Your revision test (and interactive MCQ quiz) opens right below inside this studio with one-click <strong>Copy Test</strong> and <strong>Print</strong> buttons.
               </span>
             </div>
           </div>
         </div>
+      </div>
+
+      <div ref={outputRef}>
+        <StudioOutputPanel
+          isLight={isLight}
+          title={generatedTopic || `ICSE Class 7 ${generatedSubject} Revision Test`}
+          subtitle={`${format} · ${difficulty} Tier · ${questionCount} Questions`}
+          isGenerating={isGenerating}
+          streamingText={streamingText}
+          result={studioResult}
+          error={studioError}
+          copyLabel="Copy Test"
+          allowInteractiveQuiz
+          onChallengeQuizAgain={(diff) => void runRevisionGeneration(generatedTopic, diff)}
+          onSaveQuizAttempt={(rep, qData) => onSaveQuizAttempt?.(rep, qData, generatedSubject)}
+          onClear={() => {
+            setStreamingText('');
+            setStudioResult(null);
+            setStudioError(null);
+            setActiveHistoryId(null);
+          }}
+          onShowToast={onShowToast}
+        />
       </div>
     </div>
   );

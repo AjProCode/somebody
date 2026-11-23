@@ -25,6 +25,7 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 import type { CustomSpecItem, PersonaRole } from './utils/medhaviEngine';
 import { isTestOrAssessmentContent } from './utils/testDownloadLimiter';
+import type { StudioHistoryEntry } from './utils/studioHistory';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -230,9 +231,79 @@ export async function deleteCloudSession(user: User, sessionIdRaw: string): Prom
   }
 }
 
+export async function saveCloudStudioEntry(
+  user: User,
+  entry: StudioHistoryEntry
+): Promise<void> {
+  // Zero-Leakage Guard: Never sync teacher test/assessment content to Firestore
+  if (entry.role === 'teacher' && isTestOrAssessmentContent(entry.result.content)) {
+    return;
+  }
+
+  const uid = sanitizeId(user.uid);
+  const docId = sanitizeId(entry.id.startsWith('st-') ? entry.id : `st-${entry.id}`);
+  const path = `users/${uid}/sessions/${docId}`;
+  const ref = doc(db, 'users', uid, 'sessions', docId);
+
+  const safeEntry: StudioHistoryEntry = {
+    ...entry,
+    result: {
+      ...entry.result,
+      content: entry.result.content.slice(0, 180000)
+    }
+  };
+
+  const serializedPayload = JSON.stringify({
+    __medhaviStudioEntry: safeEntry
+  }).slice(0, 195000);
+
+  const totalReasoning = Math.min(10000000, Math.max(0, entry.result.reasoningTokens || 0));
+
+  try {
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        id: docId,
+        userId: uid,
+        title: (entry.title || 'Studio Item').slice(0, 200),
+        role: entry.role === 'teacher' ? 'teacher' : 'student',
+        classLevel: 'Class 7',
+        subject: (entry.subject || 'Mathematics').slice(0, 80),
+        payload: serializedPayload,
+        reasoningTokensTotal: totalReasoning,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+    } else {
+      await updateDoc(ref, {
+        title: (entry.title || 'Studio Item').slice(0, 200),
+        classLevel: 'Class 7',
+        subject: (entry.subject || 'Mathematics').slice(0, 80),
+        payload: serializedPayload,
+        reasoningTokensTotal: totalReasoning,
+        updatedAt: serverTimestamp()
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteCloudStudioEntry(user: User, entryIdRaw: string): Promise<void> {
+  const uid = sanitizeId(user.uid);
+  const docId = sanitizeId(entryIdRaw.startsWith('st-') ? entryIdRaw : `st-${entryIdRaw}`);
+  const path = `users/${uid}/sessions/${docId}`;
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'sessions', docId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 export function subscribeToCloudSessions(
   user: User,
-  onData: (sessions: StoredSessionRecord[]) => void
+  onData: (sessions: StoredSessionRecord[]) => void,
+  onStudioData?: (entries: StudioHistoryEntry[]) => void
 ): Unsubscribe {
   const uid = sanitizeId(user.uid);
   const path = `users/${uid}/sessions`;
@@ -242,25 +313,38 @@ export function subscribeToCloudSessions(
     q,
     (snapshot) => {
       const records: StoredSessionRecord[] = [];
+      const studioRecords: StudioHistoryEntry[] = [];
       snapshot.forEach((docSnap) => {
         const d = docSnap.data();
         try {
-          const parsedMessages = JSON.parse(d.payload || '[]');
-          records.push({
-            id: d.id,
-            title: d.title,
-            timestamp: d.updatedAt?.toMillis?.() || Date.now(),
-            role: d.role === 'teacher' ? 'teacher' : 'student',
-            classLevel: d.classLevel || 'Class 7',
-            subject: d.subject || 'Mathematics',
-            messages: Array.isArray(parsedMessages) ? parsedMessages : []
-          });
+          const parsed = JSON.parse(d.payload || '[]');
+          if (Array.isArray(parsed)) {
+            records.push({
+              id: d.id,
+              title: d.title,
+              timestamp: d.updatedAt?.toMillis?.() || Date.now(),
+              role: d.role === 'teacher' ? 'teacher' : 'student',
+              classLevel: d.classLevel || 'Class 7',
+              subject: d.subject || 'Mathematics',
+              messages: parsed
+            });
+          } else if (parsed && typeof parsed === 'object' && parsed.__medhaviStudioEntry) {
+            const st = parsed.__medhaviStudioEntry as StudioHistoryEntry;
+            if (st && typeof st.id === 'string' && typeof st.studioId === 'string' && st.result?.content) {
+              studioRecords.push({
+                ...st,
+                timestamp: st.timestamp || d.updatedAt?.toMillis?.() || Date.now()
+              });
+            }
+          }
         } catch {
           // Skip malformed payload
         }
       });
       records.sort((a, b) => b.timestamp - a.timestamp);
+      studioRecords.sort((a, b) => b.timestamp - a.timestamp);
       onData(records);
+      onStudioData?.(studioRecords);
     },
     (error) => {
       handleFirestoreError(error, OperationType.LIST, path);

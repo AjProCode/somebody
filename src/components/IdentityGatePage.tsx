@@ -165,19 +165,19 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
     }
   };
 
-  const pageBg = isLight ? 'bg-[#F8F8F6] text-[#0A0A0A]' : 'bg-[#0A0D14] text-[#F4F4F0]';
-  const surfaceBg = isLight ? 'bg-white border-[#DCDFE6]' : 'bg-[#111622] border-[#2A3244]';
-  const mutedInk = isLight ? 'text-[#4A5568]' : 'text-[#94A3B8]';
+  const pageBg = isLight ? 'bg-white text-[#0A0A0A]' : 'bg-[#0A0D14] text-[#F4F4F0]';
+  const surfaceBg = isLight ? 'bg-white border-[#E5E7EB]' : 'bg-[#111622] border-[#2A3244]';
+  const mutedInk = isLight ? 'text-[#525E70]' : 'text-[#94A3B8]';
   const inputSurface = isLight
-    ? 'bg-[#F8F8F6] border-[#DCDFE6] text-[#0A0A0A] focus:border-[#0B2559] focus:bg-white'
+    ? 'bg-white border-[#E5E7EB] text-[#0A0A0A] focus:border-[#0B2559]'
     : 'bg-[#0A0D14] border-[#2A3244] text-[#F4F4F0] focus:border-white';
 
   return (
-    <div className={`min-h-[100dvh] flex flex-col justify-between ${pageBg}`}>
+    <div className={`min-h-[100dvh] flex flex-col justify-between bg-architectural-grid ${pageBg}`}>
       {/* TOP BAR CONTRACT — Single Row, 3 Minimal Zones */}
       <header
         className={`w-full px-4 sm:px-8 py-3.5 border-b ${
-          isLight ? 'bg-white border-[#DCDFE6]' : 'bg-[#111622] border-[#2A3244]'
+          isLight ? 'bg-white border-[#E5E7EB]' : 'bg-[#111622] border-[#2A3244]'
         }`}
       >
         <div className="max-w-6xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
@@ -236,7 +236,7 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
               onClick={onToggleTheme}
               aria-label={isLight ? 'Switch to Night Ink' : 'Switch to Daylight'}
               className={`md:hidden p-2 rounded-lg border cursor-pointer ${
-                isLight ? 'border-[#DCDFE6] text-[#0B2559]' : 'border-[#2A3244] text-[#F4F4F0]'
+                isLight ? 'border-[#E5E7EB] text-[#0B2559]' : 'border-[#2A3244] text-[#F4F4F0]'
               }`}
             >
               {isLight ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
@@ -258,7 +258,7 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
         {/* LEFT EDITORIAL COLUMN */}
         <section className="lg:col-span-6 space-y-8">
           <div className="space-y-4">
-            <div className={`flex flex-wrap items-center gap-2 text-xs font-mono ${mutedInk}`}>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono font-bold uppercase tracking-[0.16em] text-[#0B2559] dark:text-[#94A3B8]">
               <span>Seth M.R. Jaipuria School</span>
               <span aria-hidden="true">·</span>
               <span>ICSE Class 7</span>
@@ -266,12 +266,15 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
               <span>मेधावी</span>
             </div>
 
-            <h1 className="text-4xl sm:text-5xl font-bold font-display tracking-tight leading-[1.06] text-[#0B2559] dark:text-[#F4F4F0] text-balance">
-              Bold Minimal Intelligence for ICSE Class 7.
+            <h1 className="text-4xl sm:text-5xl lg:text-[3.35rem] font-bold font-display tracking-[-0.035em] leading-[1.03] text-[#0A0A0A] dark:text-[#F4F4F0] text-balance">
+              Your Personal AI Scholar{' '}
+              <span className="font-serif-editorial italic font-normal text-[#0B2559] dark:text-white text-[1.08em]">
+                for ICSE Class 7.
+              </span>
             </h1>
 
-            <p className={`text-sm sm:text-base leading-relaxed max-w-lg ${mutedInk}`}>
-              Zero-trust academic reasoning powered by OpenRouter NVIDIA Nemotron 3.5 Super VL under the full 20-part Jaipuria Master Constitution.
+            <p className={`text-sm sm:text-base leading-relaxed max-w-lg font-medium ${mutedInk}`}>
+              Step-by-step CISCE concept clarity, timed revision quizzes, voice study notes, and dedicated Faculty lesson &amp; assessment studios — tailored for Seth M.R. Jaipuria School, Lucknow.
             </p>
           </div>
 
@@ -292,11 +295,11 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
                     key={item.subject}
                     type="button"
                     onClick={() => onSelectSubject(item.subject)}
-                    className={`px-3.5 py-2.5 rounded-lg border text-left transition-colors cursor-pointer flex items-center justify-between gap-2 ${
+                    className={`px-3.5 py-2.5 rounded-lg border text-left grid-tile-interactive cursor-pointer flex items-center justify-between gap-2 ${
                       isActive
-                        ? 'bg-[#0B2559] border-[#0B2559] text-white'
+                        ? 'bg-[#0B2559] border-[#0B2559] text-white shadow-sm'
                         : isLight
-                        ? 'bg-white border-[#DCDFE6] text-[#0A0A0A] hover:border-[#0B2559]'
+                        ? 'bg-white border-[#E5E7EB] text-[#0A0A0A] hover:border-[#0B2559]'
                         : 'bg-[#111622] border-[#2A3244] text-[#F4F4F0] hover:border-white'
                     }`}
                   >
@@ -311,7 +314,7 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
           {/* Quiet Attribution Row */}
           <div
             className={`pt-6 border-t flex flex-wrap items-center justify-between gap-4 ${
-              isLight ? 'border-[#DCDFE6]' : 'border-[#2A3244]'
+              isLight ? 'border-[#E5E7EB]' : 'border-[#2A3244]'
             }`}
           >
             <div className="inline-flex items-center gap-2.5">
@@ -322,11 +325,11 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
                 className="w-7 h-7 rounded-md object-cover border border-[#0B2559] shrink-0"
               />
               <span className="text-xs font-semibold text-[#0B2559] dark:text-[#F4F4F0]">
-                Made with TechPreneur Club
+                Made by TechPreneur Club
               </span>
             </div>
             <span className={`text-xs font-mono ${mutedInk}`}>
-              Slide-Out History · Centered Stage
+              ICSE Class 7 · Scholars &amp; Faculty
             </span>
           </div>
         </section>
@@ -334,14 +337,20 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
         {/* RIGHT INSTITUTIONAL SIGN-IN CARD */}
         <section className="lg:col-span-6">
           <div className={`rounded-xl border overflow-hidden ${surfaceBg}`}>
-            <div className="bg-[#0B2559] text-white px-6 py-5 flex items-center justify-between gap-3">
+            <div
+              className={`px-6 py-5 border-b flex items-center justify-between gap-3 ${
+                isLight ? 'bg-white border-[#E5E7EB]' : 'bg-[#111622] border-[#2A3244]'
+              }`}
+            >
               <div>
-                <div className="text-[11px] font-mono text-white/75">
-                  Zero-Trust Identity Gate
+                <div className={`text-[11px] font-mono ${mutedInk}`}>
+                  Verified School Access
                 </div>
-                <h2 className="text-2xl font-bold font-display mt-0.5">Institutional Sign-In</h2>
+                <h2 className="text-2xl font-bold font-display mt-0.5 text-[#0B2559] dark:text-[#F4F4F0]">
+                  Scholar &amp; Faculty Sign-In
+                </h2>
               </div>
-              <span className="text-[11px] font-mono text-white/80 shrink-0">HMAC-256</span>
+              <span className={`text-[11px] font-mono shrink-0 ${mutedInk}`}>SMRJ · VII</span>
             </div>
 
             <div className="p-6 space-y-5">
@@ -350,7 +359,7 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
                 role="tablist"
                 aria-label="Institutional Role"
                 className={`grid grid-cols-2 gap-1.5 p-1 rounded-lg border ${
-                  isLight ? 'bg-[#F8F8F6] border-[#DCDFE6]' : 'bg-[#0A0D14] border-[#2A3244]'
+                  isLight ? 'bg-white border-[#E5E7EB]' : 'bg-[#0A0D14] border-[#2A3244]'
                 }`}
               >
                 <button
@@ -506,10 +515,10 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
 
               <div
                 className={`pt-4 border-t flex flex-wrap items-center justify-between gap-3 text-xs ${
-                  isLight ? 'border-[#DCDFE6]' : 'border-[#2A3244]'
+                  isLight ? 'border-[#E5E7EB]' : 'border-[#2A3244]'
                 }`}
               >
-                <span className={mutedInk}>Demo evaluation without credentials</span>
+                <span className={mutedInk}>Explore a preview without school credentials</span>
                 <button
                   type="button"
                   onClick={() => setDemoModalOpen(true)}
@@ -530,12 +539,12 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
       <footer
         className={`px-4 sm:px-8 py-3.5 pb-safe border-t text-xs font-mono flex flex-wrap items-center justify-between gap-2 ${
           isLight
-            ? 'bg-white border-[#DCDFE6] text-[#4A5568]'
+            ? 'bg-white border-[#E5E7EB] text-[#525E70]'
             : 'bg-[#111622] border-[#2A3244] text-[#94A3B8]'
         }`}
       >
         <span>Seth M.R. Jaipuria School · Lucknow · Tamso Ma Jyotirgamaya</span>
-        <span>OpenRouter NVIDIA Nemotron 3.5 Super VL · 3-Download Test Vault</span>
+        <span>ICSE Class 7 Academic Companion · Guided Study &amp; Faculty Studios</span>
       </footer>
 
       <CreateDemoAccountModal

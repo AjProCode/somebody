@@ -2,5 +2,5 @@
   "name": "Jaipuria Medhavi — मेधावी",
   "description": "Official ICSE (CISCE) Class 7 AI Scholar & Zero-Trust Pedagogical Workspace for Seth M.R. Jaipuria School, Lucknow — powered by OpenRouter NVIDIA Nemotron 3.5 Super VL and Firebase Cloud Sync.",
   "requestFramePermissions": ["microphone"],
-  "majorCapabilities": []
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

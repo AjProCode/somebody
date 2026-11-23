@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Clock,
   BookOpen,
@@ -9,20 +9,52 @@ import {
   Lightbulb,
   Target,
   Sliders,
-  HelpCircle
+  HelpCircle,
+  Loader2
 } from 'lucide-react';
+import {
+  type CustomSpecItem,
+  type IdVerificationResult,
+  type IntelligenceMode
+} from '../utils/medhaviEngine';
+import { inferGrade7Subject } from '../data/grade7Textbooks';
+import { executeStudioWorkflow, type StudioExecutionResult } from '../utils/studioRunner';
+import { StudioOutputPanel } from './StudioOutputPanel';
+import { StudioHistoryPanel } from './StudioHistoryPanel';
+import {
+  clearStudioHistory,
+  deleteStudioHistoryEntry,
+  loadStudioHistory,
+  saveStudioHistoryEntry,
+  STUDIO_HISTORY_EVENT,
+  type StudioHistoryEntry
+} from '../utils/studioHistory';
 
 interface TeacherLessonPlanDashboardProps {
   isLight: boolean;
   activeSubject: string;
-  onGeneratePrompt: (prompt: string, workflowType?: string) => void;
+  verifiedIdentity: IdVerificationResult | null;
+  selectedModel: string;
+  customSpecs: CustomSpecItem[];
+  intelligenceMode: IntelligenceMode;
+  initialHistoryEntry?: StudioHistoryEntry | null;
+  onStudioEntrySaved?: (entry: StudioHistoryEntry) => void;
+  onStudioEntryDeleted?: (id: string) => void;
+  onStudioHistoryCleared?: (removedIds: string[]) => void;
   onShowToast: (message: string, type?: 'info' | 'error' | 'success') => void;
 }
 
 export const TeacherLessonPlanDashboard: React.FC<TeacherLessonPlanDashboardProps> = ({
   isLight,
   activeSubject,
-  onGeneratePrompt,
+  verifiedIdentity,
+  selectedModel,
+  customSpecs,
+  intelligenceMode,
+  initialHistoryEntry = null,
+  onStudioEntrySaved,
+  onStudioEntryDeleted,
+  onStudioHistoryCleared,
   onShowToast
 }) => {
   const [topic, setTopic] = useState('');
@@ -32,6 +64,60 @@ export const TeacherLessonPlanDashboard: React.FC<TeacherLessonPlanDashboardProp
   const [classSection, setClassSection] = useState('VII-A');
   const [includeMisconceptions, setIncludeMisconceptions] = useState(true);
   const [includeHomeworkTier, setIncludeHomeworkTier] = useState(true);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [studioResult, setStudioResult] = useState<StudioExecutionResult | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  const [generatedTitle, setGeneratedTitle] = useState('');
+  const [historyEntries, setHistoryEntries] = useState<StudioHistoryEntry[]>(() =>
+    loadStudioHistory('lesson_arch', 'teacher')
+  );
+  const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshHistory = useCallback(() => {
+    setHistoryEntries(loadStudioHistory('lesson_arch', 'teacher'));
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
+    window.addEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+    return () => window.removeEventListener(STUDIO_HISTORY_EVENT, refreshHistory);
+  }, [refreshHistory]);
+
+  const restoreFromHistory = useCallback((entry: StudioHistoryEntry, scrollToOutput = true) => {
+    const snap = entry.inputsSnapshot || {};
+    if (typeof snap.topic === 'string') setTopic(snap.topic);
+    if (
+      snap.pedagogicalStyle === 'inquiry_experiential' ||
+      snap.pedagogicalStyle === 'socratic_dialogue' ||
+      snap.pedagogicalStyle === 'peer_problem_solving' ||
+      snap.pedagogicalStyle === 'lab_coding'
+    ) {
+      setPedagogicalStyle(snap.pedagogicalStyle);
+    }
+    if (typeof snap.classSection === 'string') setClassSection(snap.classSection);
+    if (typeof snap.includeMisconceptions === 'boolean') {
+      setIncludeMisconceptions(snap.includeMisconceptions);
+    }
+    if (typeof snap.includeHomeworkTier === 'boolean') {
+      setIncludeHomeworkTier(snap.includeHomeworkTier);
+    }
+    setGeneratedTitle(entry.title);
+    setStreamingText('');
+    setStudioError(null);
+    setStudioResult(entry.result);
+    setActiveHistoryId(entry.id);
+    if (scrollToOutput) {
+      setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (initialHistoryEntry && initialHistoryEntry.studioId === 'lesson_arch') {
+      restoreFromHistory(initialHistoryEntry, true);
+    }
+  }, [initialHistoryEntry, restoreFromHistory]);
 
   const styleLabels = {
     inquiry_experiential: {
@@ -52,15 +138,17 @@ export const TeacherLessonPlanDashboard: React.FC<TeacherLessonPlanDashboardProp
     }
   };
 
-  const handleGenerate = () => {
-    const cleanTopic = topic.trim() || `Class 7 ${activeSubject} Core Chapter`;
+  const handleGenerate = async () => {
+    if (isGenerating) return;
+    const inferredSubject = inferGrade7Subject(topic) || activeSubject;
+    const cleanTopic = topic.trim() || `Class 7 ${inferredSubject} Core Chapter`;
     const style = styleLabels[pedagogicalStyle];
 
     const prompt = `[TEACHER 40-MINUTE ICSE LESSON ARCHITECT]
 Construct a high-fidelity, minute-by-minute 40-Minute ICSE (CISCE) Lesson Plan for Seth M.R. Jaipuria School:
 - Board: ICSE (CISCE) ONLY
 - Grade: Class 7 (${classSection})
-- Subject: ${activeSubject}
+- Subject: ${inferredSubject}
 - Topic: "${cleanTopic}"
 - Pedagogical Model: ${style.name} (${style.desc})
 - Guiding School Motto: "Tamso Ma Jyotirgamaya" (Lead from darkness to light)
@@ -83,8 +171,54 @@ Strictly format the plan into the standard Seth M.R. Jaipuria School ICSE 40-min
 
 Include Teacher Blackboard / Smartboard layout notes and required apparatus/materials.`;
 
-    onGeneratePrompt(prompt, 'lesson_plan_architect');
+    setGeneratedTitle(`${cleanTopic} (${classSection})`);
+    setIsGenerating(true);
+    setStreamingText('');
+    setStudioResult(null);
+    setStudioError(null);
     onShowToast(`Generating 40-minute ICSE lesson plan on "${cleanTopic}"...`, 'info');
+    setTimeout(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+
+    try {
+      const result = await executeStudioWorkflow({
+        prompt,
+        role: 'teacher',
+        subject: inferredSubject,
+        workflowType: 'lesson_plan_architect',
+        verifiedIdentity,
+        selectedModel,
+        customSpecs,
+        intelligenceMode,
+        onDelta: (partial) => setStreamingText(partial)
+      });
+      setStudioResult(result);
+      const saved = saveStudioHistoryEntry({
+        studioId: 'lesson_arch',
+        role: 'teacher',
+        ownerId: verifiedIdentity?.schoolId || 'faculty',
+        title: `${cleanTopic} (${classSection})`,
+        subtitle: style.name,
+        subject: inferredSubject,
+        inputsSnapshot: {
+          topic: cleanTopic,
+          pedagogicalStyle,
+          classSection,
+          includeMisconceptions,
+          includeHomeworkTier
+        },
+        result
+      });
+      setActiveHistoryId(saved.id);
+      refreshHistory();
+      onStudioEntrySaved?.(saved);
+      onShowToast('40-minute lesson plan saved to Lesson Architect History.', 'success');
+    } catch (err: any) {
+      const msg = err?.message || 'Lesson plan generation failed.';
+      setStudioError(msg);
+      onShowToast(msg, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   return (
@@ -106,19 +240,49 @@ Include Teacher Blackboard / Smartboard layout notes and required apparatus/mate
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => window.print()}
-          className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
-            isLight
-              ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
-              : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
-          }`}
-        >
-          <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
-          <span>Print Plan</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+              isLight
+                ? 'border-[#0B2559]/20 bg-white text-[#0B2559] hover:border-[#0B2559]'
+                : 'border-slate-700/80 hover:border-[#F5B700]/60 text-slate-200'
+            }`}
+          >
+            <Printer className="w-3.5 h-3.5 text-[#F5B700]" />
+            <span>Print Plan</span>
+          </button>
+        </div>
       </div>
+
+      <StudioHistoryPanel
+        isLight={isLight}
+        studioName="Lesson Architect"
+        entries={historyEntries}
+        activeEntryId={activeHistoryId}
+        emptyHint="No past 40-minute lesson plans saved yet. Generated period blueprints are stored here automatically."
+        onSelectEntry={(entry) => {
+          restoreFromHistory(entry, true);
+          onShowToast(`Loaded lesson plan "${entry.title}" inside studio.`, 'info');
+        }}
+        onDeleteEntry={(id) => {
+          deleteStudioHistoryEntry(id);
+          if (activeHistoryId === id) {
+            setActiveHistoryId(null);
+          }
+          refreshHistory();
+          onStudioEntryDeleted?.(id);
+          onShowToast('Removed lesson plan from Lesson Architect history.', 'info');
+        }}
+        onClearAll={() => {
+          const removed = clearStudioHistory('lesson_arch', 'teacher');
+          setActiveHistoryId(null);
+          refreshHistory();
+          onStudioHistoryCleared?.(removed.map((r) => r.id));
+          onShowToast('Cleared Lesson Architect history.', 'info');
+        }}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left 2 Cols: Form Controls */}
@@ -249,11 +413,16 @@ Include Teacher Blackboard / Smartboard layout notes and required apparatus/mate
             {/* Generate Action Button */}
             <button
               type="button"
+              disabled={isGenerating}
               onClick={handleGenerate}
-              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] transition-colors cursor-pointer"
+              className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm bg-[#F5B700] text-[#0B2559] hover:bg-[#E0A800] disabled:opacity-60 transition-colors cursor-pointer"
             >
-              <Sparkles className="w-4 h-4" />
-              <span>Architect 40-Minute Class 7 Lesson Plan</span>
+              {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+              <span>
+                {isGenerating
+                  ? 'Architecting Lesson Plan Inside Studio…'
+                  : 'Architect 40-Minute Class 7 Lesson Plan'}
+              </span>
             </button>
           </div>
         </div>
@@ -324,10 +493,30 @@ Include Teacher Blackboard / Smartboard layout notes and required apparatus/mate
               isLight ? 'border-slate-200 text-slate-600' : 'border-slate-800 text-slate-400'
             }`}>
               <HelpCircle className="w-3.5 h-3.5 text-sky-500 shrink-0" />
-              <span>Full lesson plans stream directly to your chat and can be printed for your academic register.</span>
+              <span>Full lesson plans stream and render right here inside this studio for instant copying or printing.</span>
             </div>
           </div>
         </div>
+      </div>
+
+      <div ref={outputRef}>
+        <StudioOutputPanel
+          isLight={isLight}
+          title={generatedTitle || `40-Minute Class 7 Lesson Plan`}
+          subtitle="Seth M.R. Jaipuria School · CISCE Period Blueprint"
+          isGenerating={isGenerating}
+          streamingText={streamingText}
+          result={studioResult}
+          error={studioError}
+          copyLabel="Copy Lesson Plan"
+          onClear={() => {
+            setStreamingText('');
+            setStudioResult(null);
+            setStudioError(null);
+            setActiveHistoryId(null);
+          }}
+          onShowToast={onShowToast}
+        />
       </div>
     </div>
   );

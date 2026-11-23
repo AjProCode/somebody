@@ -24,7 +24,7 @@ export interface SubjectBlockTheme {
 const MONOCHROME_NAVY_THEME = (tag: string): SubjectBlockTheme => ({
   bg: '#0B2559',
   text: '#FFFFFF',
-  softLight: '#F8F8F6',
+  softLight: '#FFFFFF',
   softDark: '#111622',
   borderHex: '#0B2559',
   tag
