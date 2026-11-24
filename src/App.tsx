@@ -7,7 +7,6 @@ import {
   Send,
   Copy,
   Check,
-  Bookmark,
   ChevronDown,
   ChevronUp,
   Plus,
@@ -959,6 +958,50 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
     const trimmed = cleanRepeatedSpeechTokens(promptText.trim());
     if (!trimmed) return;
 
+    const persistChatSession = (
+      sessionId: string,
+      chatMessages: ChatMessage[],
+      fallbackPrompt: string
+    ) => {
+      if (chatMessages.length === 0) return;
+      const firstUserText =
+        chatMessages.find((m) => m.role === 'user')?.content || fallbackPrompt;
+      const cleanTitle = firstUserText
+        .replace(/^\[.*?\]\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 60);
+
+      const resolvedSessionSubject =
+        effectiveSubject !== 'All Subjects'
+          ? effectiveSubject
+          : inferGrade7Subject(cleanTitle) || 'ICSE Class 7';
+
+      const sessionObj: StoredSessionRecord = {
+        id: sessionId,
+        title: cleanTitle || `Class 7 ${resolvedSessionSubject} Chat`,
+        timestamp: Date.now(),
+        role: persona,
+        classLevel: LOCKED_GRADE,
+        subject: resolvedSessionSubject,
+        messages: chatMessages
+      };
+
+      setSessions((prev) => {
+        const others = prev.filter((s) => s.id !== sessionId);
+        return [sessionObj, ...others];
+      });
+
+      if (user) {
+        saveCloudSession(user, sessionObj).catch(() => {});
+      }
+    };
+
+    const sessionId = activeSessionId || `sess-${Date.now()}`;
+    if (!activeSessionId) {
+      setActiveSessionId(sessionId);
+    }
+
     // Strict Studio Isolation Guard
     if (
       persona === 'teacher' &&
@@ -985,7 +1028,9 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
         timestamp: Date.now(),
         model: 'security-guard'
       };
-      setMessages((prev) => [...prev, blockedUserMsg, blockedNoticeMsg]);
+      const nextGuardMessages = [...messages, blockedUserMsg, blockedNoticeMsg];
+      setMessages(nextGuardMessages);
+      persistChatSession(sessionId, nextGuardMessages, trimmed);
       options?.onResponseReady?.(
         'Restricted Assessment Policy: Educators cannot generate or view tests outside the Restricted ICSE Test Generation Studio.'
       );
@@ -1017,6 +1062,7 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
 
     const updatedHistory = [...messages, userMsg];
     setMessages([...updatedHistory, assistantPlaceholder]);
+    persistChatSession(sessionId, updatedHistory, trimmed);
     setComposerText('');
     setAttachedImage(null);
     setAttachedImageName('');
@@ -1208,77 +1254,30 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
         textbookReferences: finalTextbookRefs,
         manualReference: finalManualRef,
         webSources: finalWebSources,
-        webSearchUsed: effectiveWebSearch
+        webSearchUsed: finalWebSources.length > 0
       };
 
-      const finalMessages = [...updatedHistory, completedAssistantMsg];
-      setMessages(finalMessages);
+      setMessages((prev) => {
+        const hasPlaceholder = prev.some((m) => m.id === assistantMsgId);
+        const nextMessages = hasPlaceholder
+          ? prev.map((m) => (m.id === assistantMsgId ? completedAssistantMsg : m))
+          : [...prev, completedAssistantMsg];
+        queueMicrotask(() => persistChatSession(sessionId, nextMessages, trimmed));
+        return nextMessages;
+      });
       setOrbStatus('completed');
       options?.onResponseReady?.(completedAssistantMsg.content);
-
-      const sessionId = activeSessionId || `sess-${Date.now()}`;
-      setActiveSessionId(sessionId);
-      const cleanTitle = trimmed
-        .replace(/^\[.*?\]\s*/, '')
-        .slice(0, 60)
-        .trim();
-
-      const resolvedSessionSubject =
-        effectiveSubject !== 'All Subjects'
-          ? effectiveSubject
-          : inferGrade7Subject(cleanTitle) || 'ICSE Class 7';
-
-      const sessionObj: StoredSessionRecord = {
-        id: sessionId,
-        title: cleanTitle || `Class 7 ${resolvedSessionSubject} Chat`,
-        timestamp: Date.now(),
-        role: persona,
-        classLevel: LOCKED_GRADE,
-        subject: resolvedSessionSubject,
-        messages: finalMessages
-      };
-
-      setSessions((prev) => {
-        const others = prev.filter((s) => s.id !== sessionId);
-        return [sessionObj, ...others];
-      });
-
-      if (user) {
-        saveCloudSession(user, sessionObj).catch(() => {});
-      }
     } catch {
       clearTimeout(t1);
       clearTimeout(t2);
       setOrbStatus('idle');
-      setMessages(updatedHistory);
+      setMessages((prev) => {
+        const nextMessages = prev.filter((m) => m.id !== assistantMsgId);
+        queueMicrotask(() => persistChatSession(sessionId, nextMessages, trimmed));
+        return nextMessages;
+      });
       showToast('Unable to reach Medhavi Cloud right now. Please try again.', 'error');
     }
-  };
-
-  const handleSaveCurrentSession = () => {
-    if (messages.length === 0) {
-      showToast('Start an inquiry block first to save it.', 'info');
-      return;
-    }
-    const sessionId = activeSessionId || `sess-${Date.now()}`;
-    const firstUser = messages.find((m) => m.role === 'user')?.content || 'Class 7 Study';
-    const resolvedSaveSubject =
-      inferGrade7Subject(firstUser) ||
-      (subject !== 'All Subjects' ? subject : 'ICSE Class 7');
-    const record: StoredSessionRecord = {
-      id: sessionId,
-      title: firstUser.replace(/^\[.*?\]\s*/, '').slice(0, 60),
-      timestamp: Date.now(),
-      role: persona,
-      classLevel: LOCKED_GRADE,
-      subject: resolvedSaveSubject,
-      messages
-    };
-    setSessions((prev) => [record, ...prev.filter((s) => s.id !== sessionId)]);
-    if (user) {
-      saveCloudSession(user, record).catch(() => {});
-    }
-    showToast('Saved to Block History.', 'success');
   };
 
   const handleDeleteSession = (id: string) => {
@@ -1815,16 +1814,20 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
               const next = !prev;
               showToast(
                 next
-                  ? 'Live Web Search enabled — answers will include verified web sources.'
-                  : 'Live Web Search turned off — using Grade 7 books & institutional manual.',
+                  ? 'Smart Web Search enabled — school-safe web sources appear only when needed.'
+                  : 'Web Search turned off — using Grade 7 curriculum & institutional manual.',
                 'info'
               );
               return next;
             });
           }}
           aria-pressed={webSearchEnabled}
-          aria-label={webSearchEnabled ? 'Disable Live Web Search' : 'Enable Live Web Search'}
-          title={webSearchEnabled ? 'Live Web Search ON' : 'Enable Live Web Search'}
+          aria-label={webSearchEnabled ? 'Disable Smart Web Search' : 'Enable Smart Web Search'}
+          title={
+            webSearchEnabled
+              ? 'Smart Web Search ON (appears only when needed)'
+              : 'Enable Smart Web Search (appears only when needed)'
+          }
           className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
             webSearchEnabled
               ? isLight
@@ -2307,18 +2310,6 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
               }`}
             >
               + New inquiry
-            </button>
-            <button
-              type="button"
-              onClick={handleSaveCurrentSession}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-lg border text-xs font-semibold transition-colors cursor-pointer ${
-                isLight
-                  ? 'border-[#E5E7EB] text-[#0A0A0A] hover:border-[#0B2559]'
-                  : 'border-[#2A3244] text-[#F4F4F0] hover:border-white'
-              }`}
-            >
-              <Bookmark className="w-3.5 h-3.5" />
-              <span>Save</span>
             </button>
           </div>
         </div>

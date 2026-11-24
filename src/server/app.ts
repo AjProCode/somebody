@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Express, type Request } from 'express';
 import dotenv from 'dotenv';
+import { GoogleGenAI } from '@google/genai';
 import {
   LOCKED_GRADE,
   buildSystemPrompt,
@@ -35,6 +36,7 @@ import {
 } from '../data/grade7Textbooks.ts';
 import {
   performLiveWebSearch,
+  evaluateWebSearchNeed,
   formatWebSearchGroundingBlock,
   isGeminiSearchConfigured,
   searchWikimediaPageImages,
@@ -162,6 +164,69 @@ function getOpenRouterApiKey(): string {
     return '';
   }
   return trimmed;
+}
+
+function getServerGeminiApiKey(): string {
+  const raw = process.env.GEMINI_API_KEY || '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'MY_GEMINI_API_KEY' || trimmed.length < 10) {
+    return '';
+  }
+  return trimmed;
+}
+
+async function generateGeminiSecondaryReply(
+  systemPrompt: string,
+  messages: Array<{ role: string; content: string }>,
+  imageDataUrl?: string | null,
+  timeoutMs = 15000
+): Promise<string> {
+  const apiKey = getServerGeminiApiKey();
+  if (!apiKey) return '';
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
+
+    const recentMsgs = Array.isArray(messages) ? messages.slice(-6) : [];
+    const transcript = recentMsgs
+      .map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content || '').slice(0, 3500)}`)
+      .join('\n\n');
+
+    const parts: Array<any> = [{ text: transcript || 'Explain this ICSE Class 7 concept clearly.' }];
+    if (imageDataUrl && typeof imageDataUrl === 'string' && imageDataUrl.startsWith('data:image/')) {
+      const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(imageDataUrl);
+      if (match) {
+        parts.push({
+          inlineData: {
+            mimeType: match[1],
+            data: match[2]
+          }
+        });
+      }
+    }
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('gemini_timeout')), timeoutMs)
+    );
+
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: [{ role: 'user', parts }],
+        config: {
+          systemInstruction: systemPrompt
+        }
+      }),
+      timeoutPromise
+    ]);
+
+    return String(response.text || '').trim();
+  } catch {
+    return '';
+  }
 }
 
 // Fast in-memory LRU cache for instant ICSE Class 7 responses
@@ -1215,9 +1280,28 @@ export function createApp(): Express {
     }
 
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
 
+    let clientClosed = false;
+    const safeWrite = (chunk: string) => {
+      if (!clientClosed && !res.writableEnded) {
+        res.write(chunk);
+      }
+    };
+    safeWrite(': connected\n\n');
+
+    const heartbeat = setInterval(() => {
+      safeWrite(': ping\n\n');
+    }, 5000);
+    req.on('close', () => {
+      clientClosed = true;
+      clearInterval(heartbeat);
+    });
+
+    try {
     const {
       messages = [],
       context = {},
@@ -1352,19 +1436,35 @@ export function createApp(): Express {
     });
     const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
 
-    // OPTIONAL LIVE STEP 3: Perform Live Web Search when enabled by user
+    // OPTIONAL LIVE STEP 3: Only perform Live Web Search when genuinely needed
+    const strongTextbookMatch = textbookRefs.some((ref) => ref.score >= 7.5);
+    const webSearchDecision = evaluateWebSearchNeed({
+      query: lastUserMsg,
+      subject: academicCtx.subject,
+      hasImage: Boolean(imageDataUrl),
+      workflowType: academicCtx.workflowType,
+      isTestStudio: isTestStudioContext,
+      webSearchEnabled,
+      strongTextbookMatch
+    });
     let liveWebSearch: LiveWebSearchResult | null = null;
-    if (webSearchEnabled && !isTestStudioContext) {
-      liveWebSearch = await performLiveWebSearch({
-        query: lastUserMsg,
-        subject: academicCtx.subject
-      });
+    if (webSearchDecision.needed) {
+      try {
+        liveWebSearch = await performLiveWebSearch({
+          query: lastUserMsg,
+          subject: academicCtx.subject
+        });
+      } catch {
+        liveWebSearch = null;
+      }
     }
     const webSearchGroundingBlock = formatWebSearchGroundingBlock(liveWebSearch);
+    const resolvedWebProvider =
+      liveWebSearch?.provider || (webSearchEnabled ? 'not-needed' : null);
 
-    // Check fast LRU cache when no image is attached and live web search is off
+    // Check fast LRU cache when no image is attached and live web search is not needed
     const cacheKey =
-      !imageDataUrl && !isTestStudioContext && !webSearchEnabled
+      !imageDataUrl && !isTestStudioContext && !webSearchDecision.needed
         ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
@@ -1384,7 +1484,8 @@ export function createApp(): Express {
             source: 'openrouter-cache',
             manualReference: manualReferenceMeta,
             textbookReferences: textbookRefs,
-            webSources: []
+            webSources: [],
+            webSearchProvider: resolvedWebProvider
           })}\n\n`
         );
         res.end();
@@ -1407,14 +1508,16 @@ export function createApp(): Express {
     let reasoningTokens = 0;
     let completionTokens = 0;
     let totalTokens = 0;
+    let activeModelName = OPENROUTER_MODEL;
+    let activeSourceName = 'openrouter-live';
     let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
     if (openRouterKey) {
-      // 1a. Try OpenRouter streaming (nvidia/nemotron-3.5-super-vl:free)
+      // 1a. Try OpenRouter streaming (nvidia/nemotron-3.5-super-vl:free) with active end-to-end stream timeout
+      const streamController = new AbortController();
+      const streamTimeout = setTimeout(() => streamController.abort(), 15000);
+      let skipUnaryRetry = false;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000);
-
         const upstream = await fetch(OPENROUTER_ENDPOINT, {
           method: 'POST',
           headers: {
@@ -1428,17 +1531,15 @@ export function createApp(): Express {
             messages: orMessages,
             stream: true
           }),
-          signal: controller.signal
+          signal: streamController.signal
         });
-
-        clearTimeout(timeout);
 
         if (upstream.ok && upstream.body) {
           const reader = upstream.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
 
-          while (true) {
+          while (!clientClosed) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
@@ -1467,7 +1568,7 @@ export function createApp(): Express {
                   // For Teacher Studio, stream tokens immediately; for Student Portal, buffer until
                   // the silent Zero Answer Leakage check (Section 3 of Patch) verifies the response.
                   if (enforcedRole !== 'student') {
-                    res.write(`data: ${JSON.stringify({ type: 'delta', content: delta })}\n\n`);
+                    safeWrite(`data: ${JSON.stringify({ type: 'delta', content: delta })}\n\n`);
                   }
                 }
                 if (parsed?.usage) {
@@ -1482,20 +1583,26 @@ export function createApp(): Express {
               }
             }
           }
+          reader.releaseLock();
         } else {
           const errText = await upstream.text().catch(() => '');
           fallbackReason = `stream_http_${upstream.status}: ${errText.slice(0, 180)}`;
+          if (upstream.status === 429 || upstream.status >= 500) {
+            skipUnaryRetry = true;
+          }
         }
       } catch (err: any) {
         fallbackReason = `stream_error: ${err?.message || 'unknown'}`.slice(0, 180);
+        skipUnaryRetry = true;
+      } finally {
+        clearTimeout(streamTimeout);
       }
 
-      // 1b. If streaming emitted no text, try non-streaming OpenRouter completion
-      if (!streamedText.trim()) {
+      // 1b. Only retry non-streaming OpenRouter if streaming returned empty cleanly (not timed out / rate-limited)
+      if (!streamedText.trim() && !skipUnaryRetry && !clientClosed) {
+        const unaryController = new AbortController();
+        const unaryTimeout = setTimeout(() => unaryController.abort(), 10000);
         try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 30000);
-
           const unaryResp = await fetch(OPENROUTER_ENDPOINT, {
             method: 'POST',
             headers: {
@@ -1509,10 +1616,8 @@ export function createApp(): Express {
               messages: orMessages,
               stream: false
             }),
-            signal: controller.signal
+            signal: unaryController.signal
           });
-
-          clearTimeout(timeout);
 
           if (unaryResp.ok) {
             const data = await unaryResp.json();
@@ -1520,7 +1625,7 @@ export function createApp(): Express {
             if (typeof reply === 'string' && reply.trim()) {
               streamedText = reply;
               if (enforcedRole !== 'student') {
-                res.write(`data: ${JSON.stringify({ type: 'delta', content: reply })}\n\n`);
+                safeWrite(`data: ${JSON.stringify({ type: 'delta', content: reply })}\n\n`);
               }
             } else {
               fallbackReason = 'unary_empty_content';
@@ -1531,11 +1636,31 @@ export function createApp(): Express {
           }
         } catch (err: any) {
           fallbackReason = `unary_error: ${err?.message || 'unknown'}`.slice(0, 180);
+        } finally {
+          clearTimeout(unaryTimeout);
         }
       }
     }
 
-    // 2. Guaranteed Resilient ICSE Class 7 Scholarly Fallback if key is unset or upstream fails
+    // 1c. Fast secondary live AI engine (Gemini) if OpenRouter stalled or rate-limited
+    if (!streamedText.trim() && !clientClosed) {
+      const geminiReply = await generateGeminiSecondaryReply(
+        systemPrompt,
+        messages,
+        imageDataUrl,
+        14000
+      );
+      if (geminiReply) {
+        streamedText = geminiReply;
+        activeModelName = 'gemini-4-hydrogen';
+        activeSourceName = 'gemini-live-fallback';
+        if (enforcedRole !== 'student') {
+          safeWrite(`data: ${JSON.stringify({ type: 'delta', content: geminiReply })}\n\n`);
+        }
+      }
+    }
+
+    // 2. Guaranteed Resilient ICSE Class 7 Scholarly Fallback if all live models are unavailable
     let usedFallback = false;
     if (!streamedText.trim()) {
       usedFallback = true;
@@ -1550,10 +1675,12 @@ export function createApp(): Express {
         )
       );
       streamedText = fallbackReply;
-      res.write(`data: ${JSON.stringify({ type: 'delta', content: fallbackReply })}\n\n`);
+      safeWrite(`data: ${JSON.stringify({ type: 'delta', content: fallbackReply })}\n\n`);
     } else {
-      lastOpenRouterStatus = 'live';
-      lastOpenRouterDiagnostic = '';
+      if (activeSourceName === 'openrouter-live') {
+        lastOpenRouterStatus = 'live';
+        lastOpenRouterDiagnostic = '';
+      }
       const cleanStreamed = stripBookReferenceFooters(
         enforceStudentZeroAnswerLeakage(
           lastUserMsg,
@@ -1564,34 +1691,56 @@ export function createApp(): Express {
       );
       streamedText = cleanStreamed;
       if (enforcedRole === 'student') {
-        res.write(`data: ${JSON.stringify({ type: 'delta', content: cleanStreamed })}\n\n`);
+        safeWrite(`data: ${JSON.stringify({ type: 'delta', content: cleanStreamed })}\n\n`);
       }
       if (cacheKey && cleanStreamed.length > 40) {
-        setCachedResponse(cacheKey, cleanStreamed, OPENROUTER_MODEL);
+        setCachedResponse(cacheKey, cleanStreamed, activeModelName);
       }
     }
 
-    res.write(
+    safeWrite(
       `data: ${JSON.stringify({
         type: 'done',
         reasoningTokens: reasoningTokens || Math.max(24, Math.round(streamedText.length / 18)),
         completionTokens: completionTokens || Math.max(48, Math.round(streamedText.length / 4)),
         totalTokens: totalTokens || Math.max(72, Math.round(streamedText.length / 3)),
-        model: OPENROUTER_MODEL,
+        model: activeModelName,
         source: usedFallback
           ? liveWebSearch && liveWebSearch.sources.length > 0
             ? 'web-textbook-grounded'
             : 'icse-scholar-fallback'
-          : 'openrouter-live',
+          : activeSourceName,
         manualReference: manualReferenceMeta,
         textbookReferences: textbookRefs,
         webSources: liveWebSearch?.sources || [],
-        webSearchProvider: liveWebSearch?.provider || null,
+        webSearchProvider: resolvedWebProvider,
         webSearchNote: liveWebSearch?.note || null,
         ...(usedFallback && fallbackReason ? { fallbackReason } : {})
       })}\n\n`
     );
-    res.end();
+    } catch {
+      safeWrite(
+        `data: ${JSON.stringify({
+          type: 'delta',
+          content:
+            'I ran into a brief hiccup while preparing your Class 7 response. Please send your question again and I will guide you step-by-step.'
+        })}\n\n`
+      );
+      safeWrite(
+        `data: ${JSON.stringify({
+          type: 'done',
+          reasoningTokens: 16,
+          model: OPENROUTER_MODEL,
+          source: 'icse-scholar-fallback',
+          webSources: []
+        })}\n\n`
+      );
+    } finally {
+      clearInterval(heartbeat);
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
   });
 
   // Standard non-streaming chat endpoint via OpenRouter (nvidia/nemotron-3.5-super-vl:free) + Server HMAC Role Security
@@ -1716,17 +1865,33 @@ export function createApp(): Express {
       });
       const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
 
-      // OPTIONAL LIVE STEP 3: Perform Live Web Search when enabled
+      // OPTIONAL LIVE STEP 3: Only perform Live Web Search when genuinely needed
+      const strongTextbookMatch = textbookRefs.some((ref) => ref.score >= 7.5);
+      const webSearchDecision = evaluateWebSearchNeed({
+        query: lastUserMsg,
+        subject: academicCtx.subject,
+        hasImage: Boolean(imageDataUrl),
+        workflowType: academicCtx.workflowType,
+        isTestStudio: isTestStudioContext,
+        webSearchEnabled,
+        strongTextbookMatch
+      });
       let liveWebSearch: LiveWebSearchResult | null = null;
-      if (webSearchEnabled && !isTestStudioContext) {
-        liveWebSearch = await performLiveWebSearch({
-          query: lastUserMsg,
-          subject: academicCtx.subject
-        });
+      if (webSearchDecision.needed) {
+        try {
+          liveWebSearch = await performLiveWebSearch({
+            query: lastUserMsg,
+            subject: academicCtx.subject
+          });
+        } catch {
+          liveWebSearch = null;
+        }
       }
       const webSearchGroundingBlock = formatWebSearchGroundingBlock(liveWebSearch);
+      const resolvedWebProvider =
+        liveWebSearch?.provider || (webSearchEnabled ? 'not-needed' : null);
 
-      const cacheKey = !isTestStudioContext && !imageDataUrl && !webSearchEnabled
+      const cacheKey = !isTestStudioContext && !imageDataUrl && !webSearchDecision.needed
         ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
@@ -1741,7 +1906,8 @@ export function createApp(): Express {
           source: 'openrouter-cache',
           manualReference: manualReferenceMeta,
           textbookReferences: textbookRefs,
-          webSources: []
+          webSources: [],
+          webSearchProvider: resolvedWebProvider
         });
         return;
       }
@@ -1758,9 +1924,9 @@ export function createApp(): Express {
       let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
       if (openRouterKey) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
         try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 30000);
           const orMessages = buildOpenRouterMessages(systemPrompt, messages, imageDataUrl);
 
           const upstream = await fetch(OPENROUTER_ENDPOINT, {
@@ -1778,8 +1944,6 @@ export function createApp(): Express {
             }),
             signal: controller.signal
           });
-
-          clearTimeout(timeout);
 
           if (upstream.ok) {
             const data = await upstream.json();
@@ -1804,7 +1968,7 @@ export function createApp(): Express {
                 manualReference: manualReferenceMeta,
                 textbookReferences: textbookRefs,
                 webSources: liveWebSearch?.sources || [],
-                webSearchProvider: liveWebSearch?.provider || null,
+                webSearchProvider: resolvedWebProvider,
                 webSearchNote: liveWebSearch?.note || null
               });
               return;
@@ -1816,7 +1980,40 @@ export function createApp(): Express {
           }
         } catch (err: any) {
           fallbackReason = `error: ${err?.message || 'unknown'}`.slice(0, 180);
+        } finally {
+          clearTimeout(timeout);
         }
+      }
+
+      // Secondary fast live AI engine (Gemini) if OpenRouter timed out or rate-limited
+      const geminiReply = await generateGeminiSecondaryReply(
+        systemPrompt,
+        messages,
+        imageDataUrl,
+        14000
+      );
+      if (geminiReply) {
+        const cleanReply = stripBookReferenceFooters(
+          enforceStudentZeroAnswerLeakage(
+            lastUserMsg,
+            deduplicateModelLoop(geminiReply),
+            enforcedRole,
+            academicCtx.subject
+          )
+        );
+        if (cacheKey) setCachedResponse(cacheKey, cleanReply, 'gemini-4-hydrogen');
+        res.json({
+          reply: cleanReply,
+          reasoningTokens: Math.max(24, Math.round(cleanReply.length / 18)),
+          model: 'gemini-4-hydrogen',
+          source: 'gemini-live-fallback',
+          manualReference: manualReferenceMeta,
+          textbookReferences: textbookRefs,
+          webSources: liveWebSearch?.sources || [],
+          webSearchProvider: resolvedWebProvider,
+          webSearchNote: liveWebSearch?.note || null
+        });
+        return;
       }
 
       // Guaranteed Resilient ICSE Class 7 Fallback (Textbook + Live Web Grounded)
@@ -1841,7 +2038,7 @@ export function createApp(): Express {
         manualReference: manualReferenceMeta,
         textbookReferences: textbookRefs,
         webSources: liveWebSearch?.sources || [],
-        webSearchProvider: liveWebSearch?.provider || null,
+        webSearchProvider: resolvedWebProvider,
         webSearchNote: liveWebSearch?.note || null,
         ...(fallbackReason ? { fallbackReason } : {})
       });
