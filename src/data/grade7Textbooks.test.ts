@@ -71,6 +71,15 @@ test('formats silent syllabus context block without forcing Book & Page Referenc
   assert.match(block, /Do NOT append a "Book & Page Reference:"/);
 });
 
+test('does not false-match unrelated chapters on stop words or substrings like "you" vs "your"', () => {
+  const matches = searchGrade7TextbookReferences({
+    subject: 'All Subjects',
+    query:
+      'if you have 6 eggs. you boiled 2 you fried 2 and you gave you neighbour 2 .how many egg do you have'
+  });
+  assert.equal(matches.length, 0);
+});
+
 test('API endpoints /api/textbooks, /api/chat (no Book & Page Reference footer & Zero Answer Leakage intact) work end-to-end', async () => {
   const app = createApp();
   const server = http.createServer(app);

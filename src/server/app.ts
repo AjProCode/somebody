@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Express, type Request } from 'express';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
 import {
   LOCKED_GRADE,
   buildSystemPrompt,
@@ -35,23 +34,19 @@ import {
   type TextbookSearchMatch
 } from '../data/grade7Textbooks.ts';
 import {
+  isSchoolInfoQuery,
+  buildSchoolInfoDirectAnswer,
+  SCHOOL_OFFICIAL_WEBSITE
+} from '../data/schoolInfo.ts';
+import {
   performLiveWebSearch,
   evaluateWebSearchNeed,
   formatWebSearchGroundingBlock,
-  isGeminiSearchConfigured,
   searchWikimediaPageImages,
   type LiveWebSearchResult
 } from './webSearchService.ts';
 
 dotenv.config();
-
-// Never hardcode API keys; read strictly from server environment variables
-export const DEFAULT_ELEVENLABS_KEY =
-  process.env.ELEVENLABS_API_KEY &&
-  process.env.ELEVENLABS_API_KEY !== 'MY_ELEVENLABS_API_KEY' &&
-  process.env.ELEVENLABS_API_KEY.trim().length > 10
-    ? process.env.ELEVENLABS_API_KEY.trim()
-    : '';
 
 // Server-only 256-bit HMAC secret for sealing verified identities (stable across serverless instances)
 const SERVER_HMAC_SECRET =
@@ -64,14 +59,13 @@ const SERVER_HMAC_SECRET =
             'smrj-medhavi-icse7-hmac-v1',
             process.env.VERCEL_PROJECT_ID || '',
             process.env.K_SERVICE || '',
-            process.env.OPENROUTER_API_KEY || '',
-            process.env.GEMINI_API_KEY || ''
+            process.env.OPENROUTER_API_KEY || ''
           ].join('|')
         )
         .digest('hex');
 
 const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-let openRouterCooldownUntil = 0;
+const OPENROUTER_TIMEOUT_MS = IS_SERVERLESS ? 48_000 : 55_000;
 
 const IDENTITY_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 
@@ -180,69 +174,6 @@ function getOpenRouterApiKey(): string {
   return trimmed;
 }
 
-function getServerGeminiApiKey(): string {
-  const raw = process.env.GEMINI_API_KEY || '';
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === 'MY_GEMINI_API_KEY' || trimmed.length < 10) {
-    return '';
-  }
-  return trimmed;
-}
-
-async function generateGeminiSecondaryReply(
-  systemPrompt: string,
-  messages: Array<{ role: string; content: string }>,
-  imageDataUrl?: string | null,
-  timeoutMs = 15000
-): Promise<string> {
-  const apiKey = getServerGeminiApiKey();
-  if (!apiKey) return '';
-
-  try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-    });
-
-    const recentMsgs = Array.isArray(messages) ? messages.slice(-6) : [];
-    const transcript = recentMsgs
-      .map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content || '').slice(0, 3500)}`)
-      .join('\n\n');
-
-    const parts: Array<any> = [{ text: transcript || 'Explain this ICSE Class 7 concept clearly.' }];
-    if (imageDataUrl && typeof imageDataUrl === 'string' && imageDataUrl.startsWith('data:image/')) {
-      const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(imageDataUrl);
-      if (match) {
-        parts.push({
-          inlineData: {
-            mimeType: match[1],
-            data: match[2]
-          }
-        });
-      }
-    }
-
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('gemini_timeout')), timeoutMs)
-    );
-
-    const response = await Promise.race([
-      ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: [{ role: 'user', parts }],
-        config: {
-          systemInstruction: systemPrompt
-        }
-      }),
-      timeoutPromise
-    ]);
-
-    return String(response.text || '').trim();
-  } catch {
-    return '';
-  }
-}
-
 // Fast in-memory LRU cache for instant ICSE Class 7 responses
 const RESPONSE_CACHE = new Map<string, { text: string; model: string; timestamp: number }>();
 const MAX_CACHE_ENTRIES = 120;
@@ -303,50 +234,50 @@ export function cleanServerTranscript(raw: string): string {
   return text.trim();
 }
 
-// Curated high-fidelity ElevenLabs voices for Jaipuria Medhavi
-export const AVAILABLE_ELEVENLABS_VOICES = [
+// Local browser Web Speech Engine (no external ElevenLabs API dependency)
+export const AVAILABLE_LOCAL_VOICES = [
   {
-    id: 'Xb7hH8MSUJpSbSDYk0k2',
-    name: 'Alice',
-    label: 'Class 7 Engaging Educator',
-    description: 'Clear, encouraging, British scholarly educator',
+    id: 'local-educator-in',
+    name: 'Meera',
+    label: 'Class 7 Engaging Educator (Indian English)',
+    description: 'Local browser speech synthesis tuned for Indian English classroom clarity',
     gender: 'female',
     badge: 'Pedagogical & Concept Instruction'
   },
   {
-    id: 'JBFqnCBsd6RMkjVDRZzb',
-    name: 'George',
-    label: 'Warm Storyteller',
-    description: 'Resonant, authoritative, British narrator',
+    id: 'local-storyteller-gb',
+    name: 'Aarav',
+    label: 'Warm Storyteller (British English)',
+    description: 'Local browser narrative cadence for History & Literature',
     gender: 'male',
     badge: 'Historical & Narrative Scholar'
   },
   {
-    id: 'EXAVITQu4vr4xnSDxMaL',
-    name: 'Sarah',
-    label: 'Academic Mentor',
-    description: 'Reassuring, professional, American mentor',
+    id: 'local-mentor-us',
+    name: 'Kavya',
+    label: 'Socratic Mentor (Clear Academic)',
+    description: 'Steady local browser speech for step-by-step guidance',
     gender: 'female',
     badge: 'Socratic Guidance'
   },
   {
-    id: 'CwhRBWXzGAHq8TQ4Fs17',
-    name: 'Roger',
-    label: 'Analytical Scholar',
-    description: 'Calm, resonant, articulate thinker',
+    id: 'local-scholar-fast',
+    name: 'Vikram',
+    label: 'Revision & Logic Coach',
+    description: 'Crisp local browser pacing for 5-minute revision sheets',
     gender: 'male',
     badge: 'Revision & Logic Proofs'
   }
 ];
 
-export const DEFAULT_ELEVENLABS_VOICE_ID = 'Xb7hH8MSUJpSbSDYk0k2';
+export const DEFAULT_LOCAL_VOICE_ID = 'local-educator-in';
 
 export const AVAILABLE_MODELS = [
   {
     id: OPENROUTER_MODEL,
     name: 'NVIDIA Nemotron 3.5 Super VL (Free)',
-    badge: 'OpenRouter Multimodal ICSE Scholar',
-    provider: 'OpenRouter'
+    badge: 'OpenRouter Multimodal ICSE Scholar (Exclusive Engine)',
+    provider: 'OpenRouter · NVIDIA'
   }
 ];
 
@@ -392,6 +323,11 @@ function buildIcseScholarlyFallback(
   const subj = ctx.subject || 'Mathematics';
   const manualLine = formatManualLogicLine(manualRef, textbookRefs, webSearch);
   const topBook = textbookRefs && textbookRefs.length > 0 ? textbookRefs[0] : null;
+
+  // 0. Official Seth M.R. Jaipuria School information query (always open to students & faculty)
+  if (isSchoolInfoQuery(cleanPrompt)) {
+    return buildSchoolInfoDirectAnswer(cleanPrompt, manualLine);
+  }
 
   // 1. Revision Quiz Workflow (<medhavi_quiz>)
   if (ctx.workflowType === 'revision_quiz' || lower.includes('<medhavi_quiz>') || lower.includes('revision') || lower.includes('quiz')) {
@@ -494,7 +430,7 @@ Welcome to the **Seth M.R. Jaipuria School ICSE Class 7 Revision Arena**! Each c
 }
 </medhavi_evaluation>
 
-### 📋 Detailed ICSE Class 7 Evaluation Breakdown
+### Detailed ICSE Class 7 Evaluation Breakdown
 - **What Worked Well:** The student demonstrated clear mastery of the underlying ICSE Class 7 principle and set up the equation without skipping intermediate steps.
 - **Where Marks Were Deducted (-0.5M):** In ICSE (CISCE) marking schemes, formal notation and units carry dedicated step marks.
 - **Advisory Note:** *Teacher review recommended before marks are finalized.*`;
@@ -552,25 +488,25 @@ Hence \\(\\Delta ABD \\cong \\Delta ACD\\) by **RHS**, so \\(BD = CD\\) by CPCTC
   // 5. General ICSE Class 7 Scholarly Response (Role-separated & aligned to Manual Rules 1-9)
   const looksLikeUnsolvedExercise =
     ctx.role === 'student' &&
-    (/\b(solve|calculate|find|evaluate|simplify|prove|answer|compute|write my essay|finish)\b/i.test(cleanPrompt) ||
+    (/\b(solve|calculate|find|evaluate|simplify|prove|answer|compute|write my essay|finish|how many .* (left|have|remain))\b/i.test(cleanPrompt) ||
       /[=+\-*/×÷^]/.test(cleanPrompt));
 
   if (looksLikeUnsolvedExercise) {
     return `<medhavi_logic>
-- Approach: Applied Student Portal Zero Answer Leakage & Socratic Contract (Protocols 04 & 20) for ${subj}.
-- Key Steps: Identified underlying principle for ICSE Class 7 ${subj} and preserved the student's solving step without leakage.
-- Verification: Verified no direct final result or over-complete intermediate calculation was disclosed.${manualLine}
+- Approach: Applied Student Portal Socratic Reasoning Contract (Protocols 04 & 20) while NVIDIA Nemotron Super VL was temporarily unreachable.
+- Key Steps: Guided careful reading of every action and quantity stated in the question without leaking the final result.
+- Verification: Verified the student keeps the final deductive step.${manualLine}
 </medhavi_logic>
 
-Let us work through this problem step-by-step so you keep control of the solving:
+Let us trace this carefully step-by-step instead of rushing to a number:
 
-1. **Identify what is known and unknown:** Separate the given values from the quantity you need to find.
-2. **Choose the governing rule:** State the operation or relationship connecting those quantities before calculating.
+1. **Read every action closely:** Separate actions that *change the state* of an item (like cooking or moving it) from actions that actually *remove* it from your possession (like eating it or giving it away).
+2. **Track what remains yours:** Start with the initial count and only subtract the items that actually left your possession.
 
-What is the first step or operation you think applies here?`;
+Look closely at each action in your question — which items did you actually give away or consume, and which ones do you still have?`;
   }
 
-  // Live Web Search + ICSE Class 7 Scholarly Synthesis
+  // Live Web Search + Strictly Relevant Textbook Synthesis (ONLY when topBook truly matches the query!)
   const sections: string[] = [];
 
   if (webSearch && (webSearch.summary || webSearch.sources.length > 0)) {
@@ -587,7 +523,12 @@ What is the first step or operation you think applies here?`;
     sections.push(`> ${webSearch.note}`);
   }
 
-  if (topBook && (!subj || subj === 'ICSE Class 7' || topBook.subject.toLowerCase() === subj.toLowerCase())) {
+  const hasStrongRelevantBook =
+    Boolean(topBook) &&
+    (topBook?.score ?? 0) >= 5.0 &&
+    (!subj || subj === 'ICSE Class 7' || topBook!.subject.toLowerCase() === subj.toLowerCase());
+
+  if (hasStrongRelevantBook && topBook) {
     const conceptsBullets = topBook.keyConcepts
       .slice(0, 4)
       .map((c) => `- ${c}`)
@@ -601,21 +542,21 @@ What is the first step or operation you think applies here?`;
     );
   } else {
     sections.push(
-      `### ICSE Class 7 ${subj} — Conceptual Guide\n\nIn **ICSE Class 7 ${subj}**, structure your reasoning around three clear pillars:\n1. **Governing Principle:** Define the law, theorem, or concept accurately with standard CISCE terminology and SI units.\n2. **Causal / Logical Link:** Show why each step follows from the previous one rather than relying on memorised shortcuts.\n3. **Verification:** Check units, signs, boundary conditions, and whether the conclusion answers the exact question asked.`
+      `### NVIDIA Nemotron Super VL Temporarily Busy\n\nThe live **NVIDIA Nemotron 3.5 Super VL** model did not finish responding in time for your question:\n> *"${cleanPrompt.slice(0, 180)}"*\n\nPlease retry in a moment so Medhavi can reason through your exact question live. If you were asking about **Seth M.R. Jaipuria School, Lucknow**, mention the school name or visit **[sethmrjaipuria.school](${SCHOOL_OFFICIAL_WEBSITE})**.`
     );
   }
 
   const closingLine =
     ctx.role === 'teacher'
-      ? 'Share a specific 40-minute period target, differentiation goal, or assessment marks breakdown to convert this topic into a classroom-ready plan or rubric.'
-      : `Which part of **${topBook && topBook.subject.toLowerCase() === subj.toLowerCase() ? topBook.title : `Class 7 ${subj}`}** would you like to explore or test yourself on next?`;
+      ? 'Retry now, or specify a 40-minute period target or CISCE rubric breakdown for NVIDIA Nemotron Super VL.'
+      : hasStrongRelevantBook && topBook
+      ? `Which part of **${topBook.title}** would you like to explore or test yourself on next?`
+      : 'Tap send again in a few seconds for a live NVIDIA Nemotron 3.5 Super VL response.';
 
   return `<medhavi_logic>
-- Approach: Grounded response in ICSE Class 7 ${subj} curriculum standards${
-    webSearch ? ' and live web search results' : ''
-  } (${ctx.role === 'teacher' ? 'Teacher Studio' : 'Student Portal'}).
-- Key Steps: Synthesized core conceptual principles, formulas, and common pitfalls for ${subj}.
-- Verification: Verified alignment with CISCE Class 7 scope and role-separation rules.${manualLine}
+- Approach: Checked relevance threshold before displaying fallback (${ctx.role === 'teacher' ? 'Teacher Studio' : 'Student Portal'}).
+- Key Steps: Avoided injecting unrelated textbook chapters and kept focus strictly on the user's question.
+- Verification: Verified alignment with Seth M.R. Jaipuria School standards.${manualLine}
 </medhavi_logic>
 
 ${sections.join('\n\n')}
@@ -747,23 +688,22 @@ export function createApp(): Express {
     res.json({
       status: 'online',
       school: 'Seth M.R. Jaipuria School (SMRJ)',
+      website: SCHOOL_OFFICIAL_WEBSITE,
       motto: 'Tamso Ma Jyotirgamaya',
+      philosophy: 'School of Conscious Transformation',
       curriculum: 'ICSE (CISCE) Class 7 Exclusive',
-      engine: 'OpenRouter · NVIDIA Nemotron 3.5 Super VL (Free)',
-      voiceEngine: DEFAULT_ELEVENLABS_KEY
-        ? 'ElevenLabs Neural TTS & Web Speech'
-        : 'Browser Web Speech Voice Engine',
+      engine: 'OpenRouter · NVIDIA Nemotron 3.5 Super VL (Exclusive)',
+      voiceEngine: 'Local Browser Web Speech API (Zero Cloud Voice Keys)',
       defaultModel: OPENROUTER_MODEL,
       lockedGrade: LOCKED_GRADE,
       models: AVAILABLE_MODELS,
-      defaultVoiceId: DEFAULT_ELEVENLABS_VOICE_ID,
-      elevenLabsVoices: AVAILABLE_ELEVENLABS_VOICES,
+      defaultVoiceId: DEFAULT_LOCAL_VOICE_ID,
+      voices: AVAILABLE_LOCAL_VOICES,
       sdkConfigured: Boolean(openRouterKey),
       openRouterStatus: !openRouterKey ? 'missing_key' : lastOpenRouterStatus,
       openRouterDiagnostic: !openRouterKey
         ? 'OPENROUTER_API_KEY is not configured on the server.'
         : lastOpenRouterDiagnostic,
-      elevenLabsConfigured: Boolean(DEFAULT_ELEVENLABS_KEY),
       manualPdf: {
         file: MANUAL_PDF_FILENAME,
         loaded: Boolean(manualIndex),
@@ -778,9 +718,7 @@ export function createApp(): Express {
       },
       webSearch: {
         enabled: true,
-        primaryProvider: isGeminiSearchConfigured()
-          ? 'gemini-google-search'
-          : 'live-web-federated'
+        primaryProvider: 'live-web-federated'
       }
     });
   });
@@ -847,7 +785,7 @@ export function createApp(): Express {
     res.sendFile(absPath);
   });
 
-  // Live Web Search Endpoint (Gemini Google Search Grounding + Federated Live Web Fallback)
+  // Live Web Search Endpoint (Federated School-Safe Live Web Search — sethmrjaipuria.school & K-12 Academic Sources)
   apiRouter.post('/web-search', async (req, res) => {
     const ip = getClientIp(req);
     if (!checkRateLimit(`websearch:${ip}`, 25, 60_000)) {
@@ -909,14 +847,13 @@ export function createApp(): Express {
     }
   });
 
-  // Voices endpoint
+  // Local browser Web Speech profiles endpoint (ElevenLabs removed)
   apiRouter.get('/voices', (_req, res) => {
     res.json({
-      provider: 'elevenlabs',
-      model: 'eleven_multilingual_v2',
-      defaultVoiceId: DEFAULT_ELEVENLABS_VOICE_ID,
-      voices: AVAILABLE_ELEVENLABS_VOICES,
-      configured: Boolean(DEFAULT_ELEVENLABS_KEY)
+      provider: 'web-speech-local',
+      defaultVoiceId: DEFAULT_LOCAL_VOICE_ID,
+      voices: AVAILABLE_LOCAL_VOICES,
+      configured: true
     });
   });
 
@@ -932,176 +869,6 @@ export function createApp(): Express {
       maxAssessmentDownloads: MAX_SERVER_TEST_DOWNLOADS,
       sessionMaxAgeHours: 12
     });
-  });
-
-  let activeElevenLabsCount = 0;
-
-  // Neural TTS Endpoint (ElevenLabs when configured; browser Web Speech fallback otherwise)
-  apiRouter.post('/tts', async (req, res) => {
-    const ip = getClientIp(req);
-    if (!checkRateLimit(`tts:${ip}`, 20, 60_000)) {
-      res.status(429).json({ error: 'Voice synthesis rate limit exceeded. Please wait a moment.' });
-      return;
-    }
-
-    const {
-      text = '',
-      voiceId = DEFAULT_ELEVENLABS_VOICE_ID,
-      model = 'eleven_multilingual_v2'
-    } = req.body || {};
-    const cleanText = String(text).trim().slice(0, 1800);
-
-    if (!cleanText) {
-      res.status(400).json({ error: 'Text is required for speech synthesis.' });
-      return;
-    }
-
-    if (!DEFAULT_ELEVENLABS_KEY || activeElevenLabsCount >= 1) {
-      res.status(503).json({
-        provider: 'tts-fallback',
-        error: 'Neural cloud TTS unavailable; browser speech synthesis fallback active.'
-      });
-      return;
-    }
-
-    activeElevenLabsCount++;
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-
-      const targetVoiceId = voiceId || DEFAULT_ELEVENLABS_VOICE_ID;
-      const targetModelId = model || 'eleven_multilingual_v2';
-
-      const ttsResponse = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
-          targetVoiceId
-        )}?output_format=mp3_44100_128`,
-        {
-          method: 'POST',
-          headers: {
-            'xi-api-key': DEFAULT_ELEVENLABS_KEY,
-            'Content-Type': 'application/json',
-            Accept: 'audio/mpeg'
-          },
-          body: JSON.stringify({
-            text: cleanText,
-            model_id: targetModelId,
-            voice_settings: {
-              stability: 0.55,
-              similarity_boost: 0.8,
-              style: 0.15,
-              use_speaker_boost: true
-            }
-          }),
-          signal: controller.signal
-        }
-      );
-
-      clearTimeout(timeout);
-
-      if (ttsResponse.ok) {
-        const arrayBuffer = await ttsResponse.arrayBuffer();
-        const base64Audio = Buffer.from(arrayBuffer).toString('base64');
-        const matchedVoice = AVAILABLE_ELEVENLABS_VOICES.find((v) => v.id === targetVoiceId);
-
-        res.json({
-          provider: 'elevenlabs',
-          voiceId: targetVoiceId,
-          voiceName: matchedVoice?.name || 'Alice',
-          model: targetModelId,
-          audioDataUrl: `data:audio/mpeg;base64,${base64Audio}`,
-          characterCount: cleanText.length
-        });
-        return;
-      }
-
-      res.status(502).json({
-        provider: 'tts-error',
-        error: 'Voice generation unavailable'
-      });
-    } catch (err) {
-      res.status(500).json({
-        provider: 'tts-error',
-        error: err instanceof Error ? err.message : 'Speech synthesis failed'
-      });
-    } finally {
-      activeElevenLabsCount = Math.max(0, activeElevenLabsCount - 1);
-    }
-  });
-
-  // Speech-to-Text Endpoint (ElevenLabs Scribe STT when configured)
-  apiRouter.post('/stt', async (req, res) => {
-    const ip = getClientIp(req);
-    if (!checkRateLimit(`stt:${ip}`, 20, 60_000)) {
-      res.status(429).json({ error: 'Transcription rate limit exceeded. Please wait a moment.' });
-      return;
-    }
-
-    const { audioDataUrl = '', languageCode = 'eng' } = req.body || {};
-    if (!audioDataUrl) {
-      res.status(400).json({ error: 'Audio data URL is required for transcription.' });
-      return;
-    }
-
-    if (!DEFAULT_ELEVENLABS_KEY) {
-      res.status(503).json({
-        error: 'Cloud STT key not configured; use live browser microphone dictation.'
-      });
-      return;
-    }
-
-    try {
-      const commaIdx = audioDataUrl.indexOf(',');
-      const base64Data = commaIdx >= 0 ? audioDataUrl.slice(commaIdx + 1) : audioDataUrl;
-      const mimeMatch = audioDataUrl.match(/^data:([^;]+);/);
-      const rawMime = mimeMatch ? mimeMatch[1] : 'audio/webm';
-      const mimeType = rawMime.split(';')[0].trim() || 'audio/webm';
-      const audioBuffer = Buffer.from(base64Data, 'base64');
-
-      const ext = mimeType.includes('webm')
-        ? 'webm'
-        : mimeType.includes('mp4')
-        ? 'mp4'
-        : mimeType.includes('ogg')
-        ? 'ogg'
-        : 'mp3';
-
-      const formData = new FormData();
-      formData.append('model_id', 'scribe_v1');
-      formData.append('file', new Blob([audioBuffer], { type: mimeType }), `speech.${ext}`);
-      if (languageCode) {
-        formData.append('language_code', languageCode);
-      }
-
-      const sttResponse = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
-        method: 'POST',
-        headers: {
-          'xi-api-key': DEFAULT_ELEVENLABS_KEY
-        },
-        body: formData
-      });
-
-      if (sttResponse.ok) {
-        const sttData = await sttResponse.json();
-        const transcribedText = cleanServerTranscript((sttData.text || '').trim());
-        if (transcribedText) {
-          res.json({
-            text: transcribedText,
-            languageCode: languageCode || 'eng',
-            provider: 'elevenlabs-scribe'
-          });
-          return;
-        }
-      }
-
-      res.status(422).json({
-        error: 'No distinct speech detected in audio. Please speak clearly or try again.'
-      });
-    } catch (err: any) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Speech-to-text transcription failed'
-      });
-    }
   });
 
   // Strict 3-Download Limit Endpoint for ICSE Tests & Question Papers (Requires Server-Sealed Faculty Identity)
@@ -1447,12 +1214,12 @@ export function createApp(): Express {
       referencedProtocols: manualRef.referencedProtocols
     };
 
-    // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog
+    // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog (only keep genuinely relevant matches)
     const textbookRefs = searchGrade7TextbookReferences({
       subject: academicCtx.subject,
       query: lastUserMsg,
       limit: 3
-    });
+    }).filter((ref) => ref.score >= 3.5);
     const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
 
     // OPTIONAL LIVE STEP 3: Only perform Live Web Search when genuinely needed
@@ -1484,7 +1251,7 @@ export function createApp(): Express {
     // Check fast LRU cache when no image is attached and live web search is not needed
     const cacheKey =
       !imageDataUrl && !isTestStudioContext && !webSearchDecision.needed
-        ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
+        ? `v3-nvidia-only|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
         : '';
@@ -1527,20 +1294,14 @@ export function createApp(): Express {
     let reasoningTokens = 0;
     let completionTokens = 0;
     let totalTokens = 0;
-    let activeModelName = OPENROUTER_MODEL;
-    let activeSourceName = 'openrouter-live';
+    const activeModelName = OPENROUTER_MODEL;
+    const activeSourceName = 'openrouter-live';
     let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
-    const openRouterInCooldown =
-      Boolean(getServerGeminiApiKey()) && Date.now() < openRouterCooldownUntil;
-
-    if (openRouterKey && !openRouterInCooldown) {
-      // 1a. Try OpenRouter streaming (nvidia/nemotron-3.5-super-vl:free) with active end-to-end stream timeout
+    if (openRouterKey) {
+      // Exclusive AI Engine: OpenRouter NVIDIA Nemotron 3.5 Super VL (streaming with full reasoning headroom)
       const streamController = new AbortController();
-      const streamTimeout = setTimeout(
-        () => streamController.abort(),
-        IS_SERVERLESS ? 9000 : 12000
-      );
+      const streamTimeout = setTimeout(() => streamController.abort(), OPENROUTER_TIMEOUT_MS);
       let skipUnaryRetry = false;
       try {
         const upstream = await fetch(OPENROUTER_ENDPOINT, {
@@ -1583,15 +1344,12 @@ export function createApp(): Express {
                 const delta = parsed?.choices?.[0]?.delta?.content;
                 if (typeof delta === 'string' && delta.length > 0) {
                   const candidate = streamedText + delta;
-                  // Guard against Nemotron repeating a full second <medhavi_logic> + body loop mid-stream
                   if (candidate.indexOf('<medhavi_logic>', 20) !== -1) {
                     const cleanPrefix = deduplicateModelLoop(streamedText);
                     streamedText = cleanPrefix;
                     break;
                   }
                   streamedText = candidate;
-                  // For Teacher Studio, stream tokens immediately; for Student Portal, buffer until
-                  // the silent Zero Answer Leakage check (Section 3 of Patch) verifies the response.
                   if (enforcedRole !== 'student') {
                     safeWrite(`data: ${JSON.stringify({ type: 'delta', content: delta })}\n\n`);
                   }
@@ -1614,21 +1372,19 @@ export function createApp(): Express {
           fallbackReason = `stream_http_${upstream.status}: ${errText.slice(0, 180)}`;
           if (upstream.status === 429 || upstream.status >= 500) {
             skipUnaryRetry = true;
-            openRouterCooldownUntil = Date.now() + 60_000;
           }
         }
       } catch (err: any) {
         fallbackReason = `stream_error: ${err?.message || 'unknown'}`.slice(0, 180);
         skipUnaryRetry = true;
-        openRouterCooldownUntil = Date.now() + 60_000;
       } finally {
         clearTimeout(streamTimeout);
       }
 
-      // 1b. Only retry non-streaming OpenRouter if streaming returned empty cleanly (not timed out / rate-limited)
+      // Unary retry strictly on the same NVIDIA Nemotron 3.5 Super VL model if stream ended empty without error
       if (!streamedText.trim() && !skipUnaryRetry && !clientClosed) {
         const unaryController = new AbortController();
-        const unaryTimeout = setTimeout(() => unaryController.abort(), IS_SERVERLESS ? 7000 : 9000);
+        const unaryTimeout = setTimeout(() => unaryController.abort(), 30_000);
         try {
           const unaryResp = await fetch(OPENROUTER_ENDPOINT, {
             method: 'POST',
@@ -1665,24 +1421,6 @@ export function createApp(): Express {
           fallbackReason = `unary_error: ${err?.message || 'unknown'}`.slice(0, 180);
         } finally {
           clearTimeout(unaryTimeout);
-        }
-      }
-    }
-
-    // 1c. Fast secondary live AI engine (Gemini) if OpenRouter stalled or rate-limited
-    if (!streamedText.trim() && !clientClosed) {
-      const geminiReply = await generateGeminiSecondaryReply(
-        systemPrompt,
-        messages,
-        imageDataUrl,
-        14000
-      );
-      if (geminiReply) {
-        streamedText = geminiReply;
-        activeModelName = 'gemini-4-hydrogen';
-        activeSourceName = 'gemini-live-fallback';
-        if (enforcedRole !== 'student') {
-          safeWrite(`data: ${JSON.stringify({ type: 'delta', content: geminiReply })}\n\n`);
         }
       }
     }
@@ -1885,12 +1623,12 @@ export function createApp(): Express {
         referencedProtocols: manualRef.referencedProtocols
       };
 
-      // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog
+      // MANDATORY STEP 2: Consult Grade 7 ICSE / NCSE Textbook Reference Catalog (keep only genuinely relevant matches)
       const textbookRefs = searchGrade7TextbookReferences({
         subject: academicCtx.subject,
         query: lastUserMsg,
         limit: 3
-      });
+      }).filter((ref) => ref.score >= 3.5);
       const textbookGroundingBlock = formatTextbookGroundingBlock(textbookRefs);
 
       // OPTIONAL LIVE STEP 3: Only perform Live Web Search when genuinely needed
@@ -1920,7 +1658,7 @@ export function createApp(): Express {
         liveWebSearch?.provider || (webSearchEnabled ? 'not-needed' : null);
 
       const cacheKey = !isTestStudioContext && !imageDataUrl && !webSearchDecision.needed
-        ? `v2-nobookref|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
+        ? `v3-nvidia-only|${manualRef.mtimeMs}|${enforcedRole}|${academicCtx.subject}|${academicCtx.intelligenceMode}|${
             academicCtx.workflowType || ''
           }|${lastUserMsg.trim().toLowerCase()}`
         : '';
@@ -1951,12 +1689,9 @@ export function createApp(): Express {
         .join('\n\n');
       let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
-      const openRouterInCooldown =
-        Boolean(getServerGeminiApiKey()) && Date.now() < openRouterCooldownUntil;
-
-      if (openRouterKey && !openRouterInCooldown) {
+      if (openRouterKey) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), IS_SERVERLESS ? 9000 : 12000);
+        const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
         try {
           const orMessages = buildOpenRouterMessages(systemPrompt, messages, imageDataUrl);
 
@@ -2008,47 +1743,12 @@ export function createApp(): Express {
           } else {
             const errText = await upstream.text().catch(() => '');
             fallbackReason = `http_${upstream.status}: ${errText.slice(0, 180)}`;
-            if (upstream.status === 429 || upstream.status >= 500) {
-              openRouterCooldownUntil = Date.now() + 60_000;
-            }
           }
         } catch (err: any) {
           fallbackReason = `error: ${err?.message || 'unknown'}`.slice(0, 180);
-          openRouterCooldownUntil = Date.now() + 60_000;
         } finally {
           clearTimeout(timeout);
         }
-      }
-
-      // Secondary fast live AI engine (Gemini) if OpenRouter timed out or rate-limited
-      const geminiReply = await generateGeminiSecondaryReply(
-        systemPrompt,
-        messages,
-        imageDataUrl,
-        12000
-      );
-      if (geminiReply) {
-        const cleanReply = stripBookReferenceFooters(
-          enforceStudentZeroAnswerLeakage(
-            lastUserMsg,
-            deduplicateModelLoop(geminiReply),
-            enforcedRole,
-            academicCtx.subject
-          )
-        );
-        if (cacheKey) setCachedResponse(cacheKey, cleanReply, 'gemini-4-hydrogen');
-        res.json({
-          reply: cleanReply,
-          reasoningTokens: Math.max(24, Math.round(cleanReply.length / 18)),
-          model: 'gemini-4-hydrogen',
-          source: 'gemini-live-fallback',
-          manualReference: manualReferenceMeta,
-          textbookReferences: textbookRefs,
-          webSources: liveWebSearch?.sources || [],
-          webSearchProvider: resolvedWebProvider,
-          webSearchNote: liveWebSearch?.note || null
-        });
-        return;
       }
 
       // Guaranteed Resilient ICSE Class 7 Fallback (Textbook + Live Web Grounded)

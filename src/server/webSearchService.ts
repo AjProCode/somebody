@@ -1,4 +1,5 @@
-import { GoogleGenAI } from '@google/genai';
+// School-Safe Live Federated Web Search Service (Wikipedia + DuckDuckGo Strict SafeSearch + sethmrjaipuria.school)
+// Zero Gemini dependency — strictly school-appropriate K-12 filtering for ICSE Class 7.
 
 export interface WebSearchSource {
   title: string;
@@ -9,7 +10,7 @@ export interface WebSearchSource {
 
 export interface LiveWebSearchResult {
   query: string;
-  provider: 'gemini-google-search' | 'live-web-federated' | 'unavailable' | 'not-needed';
+  provider: 'live-web-federated' | 'unavailable' | 'not-needed';
   summary: string;
   sources: WebSearchSource[];
   retrievedAt: string;
@@ -60,8 +61,7 @@ const GREETING_OR_SHORT_META_PATTERN =
 const CONVERSATIONAL_OR_CREATIVE_PATTERN =
   /^(explain\s+(again|more|simply|this)|simplify\s+(this|that)|give\s+(me\s+)?another\s+example|make\s+it\s+shorter|summarize(\s+this|\s+that)?|translate\s+this|check\s+my\s+(grammar|spelling|work|answer)|correct\s+this\s+sentence|write\s+(a|an)\s+(short\s+)?(essay|letter|story|poem|paragraph|speech|dialogue|diary|notice|email|application|composition)|give\s+me\s+study\s+tips|how\s+to\s+(study|prepare\s+for\s+exams?)|make\s+a\s+(study\s+)?timetable)\b/i;
 
-const PURE_CALCULATION_PATTERN =
-  /^[\d\s+\-*/×÷^%().,=<>xXyYzZaAbBcC]+$/;
+const PURE_CALCULATION_PATTERN = /^[\d\s+\-*/×÷^%().,=<>xXyYzZaAbBcC]+$/;
 
 const HOMEWORK_SOLVE_PATTERN =
   /\b(solve|calculate|compute|evaluate|find\s+the\s+value(\s+of)?|simplify|factori[sz]e|convert\s+\d|what\s+is\s+\d+\s*[+\-*/×÷^%]|divide\s+\d|multiply\s+\d|add\s+\d|subtract\s+\d|lcm\s+of\s+\d|hcf\s+of\s+\d|square\s+root\s+of\s+\d|percentage\s+of\s+\d)\b/i;
@@ -137,7 +137,6 @@ const STOP_WORDS = new Set([
   'links',
   'sources',
   'find',
-  'about',
   'more',
   'info',
   'information',
@@ -196,6 +195,7 @@ const INAPPROPRIATE_SCHOOL_CONTENT_PATTERN =
   /\b(porn|porno|pornography|xxx|nsfw|hentai|onlyfans|xvideos|xnxx|pornhub|redtube|youporn|chaturbate|stripchat|erotic|erotica|escort|fetish|bdsm|sexting|nude|nudes|naked|camgirl|camboy|playboy|brazzers|milf|explicit\s+sex|adult\s+video|strip\s+club|casino|gambling|sportsbook|slot\s+machine|roulette|bet365|1xbet|betway|pokerstars|dream11|satta|matka|rummycircle|piratebay|torrent\s+download|cracked\s+apk|keygen|warez|buy\s+weed|cocaine|heroin|methamphetamine|suicide\s+method|self[\s-]?harm|bestgore|liveleak|beheading)\b/i;
 
 const TRUSTED_ACADEMIC_DOMAINS = [
+  'sethmrjaipuria.school',
   'wikipedia.org',
   'britannica.com',
   'ncert.nic.in',
@@ -255,7 +255,6 @@ export function evaluateWebSearchNeed(input: WebSearchNeedInput): WebSearchNeedD
     return { needed: false, reason: 'pure_calculation_or_homework' };
   }
 
-  // Uploaded worksheets / diagrams don't need external web search unless explicitly requested or current-event related
   if (input.hasImage) {
     return { needed: false, reason: 'pure_calculation_or_homework' };
   }
@@ -328,7 +327,6 @@ export function isAppropriateWebSource(
     return false;
   }
 
-  // Block ad redirectors and tracking URLs
   const lowerUrl = rawUrl.toLowerCase();
   if (
     lowerUrl.includes('duckduckgo.com/y.js') ||
@@ -340,7 +338,6 @@ export function isAppropriateWebSource(
     return false;
   }
 
-  // Block commercial spam, URL shorteners, gambling, piracy, and adult domains
   const checkHostAndTitle = `${hostname} ${title.toLowerCase()}`;
   for (const blocked of BLOCKED_HOSTS) {
     if (hostname.includes(blocked) || checkHostAndTitle.includes(blocked)) {
@@ -348,19 +345,16 @@ export function isAppropriateWebSource(
     }
   }
 
-  // Strict K-12 Class 7 (ages 11-14) school safety check across URL, title, and snippet
   const combinedText = `${rawUrl} ${title} ${snippet}`;
   if (!isAppropriateTextForSchool(combinedText)) {
     return false;
   }
 
-  // Grounding redirect links from Gemini Google Search already passed Google Search retrieval;
-  // skip strict URL/snippet token overlap only for vertexaisearch grounding links when title is clean.
-  const isVertexGroundingLink =
+  const isTrustedRedirect =
     Boolean(options?.allowGroundingRedirect) &&
     hostname.endsWith('vertexaisearch.cloud.google.com');
 
-  if (!isVertexGroundingLink) {
+  if (!isTrustedRedirect) {
     const queryTokens = extractMeaningfulTokens(query);
     if (queryTokens.length > 0) {
       const searchable = `${title} ${snippet} ${hostname} ${parsed.pathname}`.toLowerCase();
@@ -379,6 +373,10 @@ function scoreWebSourceQuality(source: WebSearchSource, query: string): number {
   let score = 0;
 
   if (source.url.startsWith('https://')) score += 1;
+
+  if (domain === 'sethmrjaipuria.school' || domain.endsWith('.sethmrjaipuria.school')) {
+    score += 12;
+  }
 
   if (
     domain.endsWith('.edu') ||
@@ -438,15 +436,6 @@ function filterAndRankWebSources(
     .map((entry) => entry.source);
 }
 
-function getGeminiApiKey(): string {
-  const raw = process.env.GEMINI_API_KEY || '';
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed === 'MY_GEMINI_API_KEY' || trimmed.length < 10) {
-    return '';
-  }
-  return trimmed;
-}
-
 function extractDomain(url: string): string {
   try {
     const parsed = new URL(url);
@@ -487,77 +476,6 @@ function cleanSearchQuery(raw: string, subject?: string): string {
     .slice(0, 260);
   if (!stripped) return subject ? `ICSE Class 7 ${subject}` : 'ICSE Class 7 curriculum';
   return stripped;
-}
-
-async function searchViaGeminiGoogleGrounding(
-  query: string,
-  subject?: string
-): Promise<LiveWebSearchResult | null> {
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) return null;
-
-  try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-    });
-
-    const groundedPrompt = [
-      `Perform a strictly school-safe, age-appropriate (ICSE Class 7, ages 11–14) factual live web search for this academic inquiry${
-        subject ? ` (Subject: ${subject})` : ''
-      }:`,
-      query,
-      '',
-      'Safety & Relevance Rules:',
-      '- Only use reputable educational, institutional, scientific, encyclopedic, or verified news sources.',
-      '- Exclude adult, violent, gambling, shopping, spam, or off-topic sites.',
-      '- Return a concise, verified factual summary (3 to 5 bullet points max) strictly grounded in search results. Do not invent facts or URLs.'
-    ].join('\n');
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: groundedPrompt,
-      config: {
-        tools: [{ googleSearch: {} }]
-      }
-    });
-
-    const rawSummaryText = (response.text || '').trim();
-    const summaryText = isAppropriateTextForSchool(rawSummaryText) ? rawSummaryText : '';
-    const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const rawSources: WebSearchSource[] = [];
-
-    for (const chunk of rawChunks) {
-      const uri = chunk?.web?.uri;
-      const title = chunk?.web?.title;
-      if (typeof uri === 'string' && uri.startsWith('http')) {
-        rawSources.push({
-          title: (typeof title === 'string' && title.trim()) || extractDomain(uri),
-          url: uri,
-          domain: extractDomain(uri),
-          snippet: 'Verified via Google Search grounding'
-        });
-      }
-    }
-
-    const sources = filterAndRankWebSources(rawSources, query, {
-      allowGroundingRedirect: true,
-      limit: 4
-    });
-
-    if (summaryText || sources.length > 0) {
-      return {
-        query,
-        provider: 'gemini-google-search',
-        summary: summaryText.slice(0, 1400),
-        sources,
-        retrievedAt: new Date().toISOString()
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 async function fetchWikipediaSources(query: string): Promise<WebSearchSource[]> {
@@ -604,7 +522,6 @@ async function fetchDuckDuckGoSources(query: string): Promise<WebSearchSource[]>
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5500);
   try {
-    // kp=1 enforces Strict SafeSearch on DuckDuckGo
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(
       query
     )}&format=json&no_html=1&skip_disambig=1&kp=1`;
@@ -658,7 +575,6 @@ async function fetchDuckDuckGoHtmlResults(query: string): Promise<WebSearchSourc
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5500);
   try {
-    // kp=1 enforces Strict SafeSearch on DuckDuckGo HTML search
     const res = await fetch(
       `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kp=1`,
       {
@@ -692,13 +608,11 @@ async function fetchDuckDuckGoHtmlResults(query: string): Promise<WebSearchSourc
       let href = match[1] || '';
       const rawTitle = stripHtmlTags(match[2] || '');
 
-      // Skip DuckDuckGo sponsored/ad redirect links
       if (href.includes('duckduckgo.com/y.js') || href.includes('ad_domain=')) {
         idx++;
         continue;
       }
 
-      // Decode DuckDuckGo redirect URLs (?uddg=...)
       if (href.includes('uddg=')) {
         try {
           const parsed = new URL(
@@ -734,7 +648,6 @@ export async function performLiveWebSearch(params: {
 }): Promise<LiveWebSearchResult> {
   const cleanedQuery = cleanSearchQuery(params.query, params.subject);
 
-  // Reject unsafe queries outright before making any external request
   if (!isAppropriateTextForSchool(cleanedQuery)) {
     return {
       query: cleanedQuery,
@@ -746,13 +659,7 @@ export async function performLiveWebSearch(params: {
     };
   }
 
-  // 1. Primary: Gemini 4 Hydrogen with native Google Search Grounding when GEMINI_API_KEY is available
-  const geminiResult = await searchViaGeminiGoogleGrounding(cleanedQuery, params.subject);
-  if (geminiResult && (geminiResult.sources.length > 0 || geminiResult.summary.length > 20)) {
-    return geminiResult;
-  }
-
-  // 2. Universal Live Web Search: Parallel Wikipedia + DuckDuckGo Instant Answer + DuckDuckGo SafeSearch Web
+  // Federated School-Safe Live Web Search: Wikipedia + DuckDuckGo Instant Answer + DuckDuckGo Strict SafeSearch
   const [wikiSources, ddgInstant, ddgHtml] = await Promise.all([
     fetchWikipediaSources(cleanedQuery),
     fetchDuckDuckGoSources(cleanedQuery),
@@ -830,10 +737,6 @@ export function formatWebSearchGroundingBlock(searchResult: LiveWebSearchResult 
   return lines.join('\n');
 }
 
-export function isGeminiSearchConfigured(): boolean {
-  return Boolean(getGeminiApiKey());
-}
-
 export interface TextbookPageImageResult {
   title: string;
   imageUrl: string;
@@ -855,7 +758,6 @@ export async function searchWikimediaPageImages(
   const results: TextbookPageImageResult[] = [];
   const seenUrls = new Set<string>();
 
-  // 1. Primary: Curated encyclopedic diagrams/illustrations from Wikipedia article pageimages
   const wikiCtrl = new AbortController();
   const wikiTimeout = setTimeout(() => wikiCtrl.abort(), 5000);
   try {
@@ -914,7 +816,6 @@ export async function searchWikimediaPageImages(
     clearTimeout(wikiTimeout);
   }
 
-  // 2. Fallback: Wikimedia Commons explicit diagram search if fewer than `limit` found
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {

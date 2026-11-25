@@ -61,6 +61,7 @@ import { TeacherTestGeneratorDashboard } from './components/TeacherTestGenerator
 import { TeacherEvaluationDashboard } from './components/TeacherEvaluationDashboard';
 import { TeacherLessonPlanDashboard } from './components/TeacherLessonPlanDashboard';
 import { TeacherCircularDashboard } from './components/TeacherCircularDashboard';
+import { SecurityFeaturesDashboard } from './components/SecurityFeaturesDashboard';
 import { StudentRevisionTestDashboard } from './components/StudentRevisionTestDashboard';
 import { StudentRevisionDashboard } from './components/StudentRevisionDashboard';
 import { Grade7TextbookLibrary } from './components/Grade7TextbookLibrary';
@@ -129,6 +130,31 @@ interface RoleToolItem {
   workflowType?: string;
 }
 
+const FACULTY_IDLE_TIMEOUT_MINUTES = 30;
+const FACULTY_IDLE_TIMEOUT_MS = FACULTY_IDLE_TIMEOUT_MINUTES * 60 * 1000;
+const SESSION_MAX_AGE_HOURS = 12;
+const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_HOURS * 60 * 60 * 1000;
+const LAST_ACTIVITY_STORAGE_KEY = 'medhavi_last_activity';
+
+function isIdentitySessionExpired(
+  identity: IdVerificationResult | null,
+  lastActivityTimestamp: number,
+  now = Date.now()
+): boolean {
+  if (!identity) return false;
+  if (identity.issuedAt && now - identity.issuedAt > SESSION_MAX_AGE_MS) {
+    return true;
+  }
+  if (
+    identity.extractedRole === 'teacher' &&
+    lastActivityTimestamp > 0 &&
+    now - lastActivityTimestamp > FACULTY_IDLE_TIMEOUT_MS
+  ) {
+    return true;
+  }
+  return false;
+}
+
 const STUDENT_ONLY_TOOLS: RoleToolItem[] = [
   {
     id: 'revision_arena',
@@ -144,6 +170,14 @@ const STUDENT_ONLY_TOOLS: RoleToolItem[] = [
     label: '5-Min Exam Revision',
     shortLabel: '5-Min Revision',
     description: 'High-yield formulas, traps & 60-sec recall sheets',
+    isViewTool: true,
+    prompt: ''
+  },
+  {
+    id: 'security_panel',
+    label: 'Security Features',
+    shortLabel: 'Security Features',
+    description: 'Session re-login, vault locks & zero-trust rules',
     isViewTool: true,
     prompt: ''
   }
@@ -180,6 +214,14 @@ const TEACHER_ONLY_TOOLS: RoleToolItem[] = [
     label: 'Parent Circular',
     shortLabel: 'Circulars',
     description: 'Bilingual English & हिन्दी official notice draft',
+    isViewTool: true,
+    prompt: ''
+  },
+  {
+    id: 'security_panel',
+    label: 'Security Features',
+    shortLabel: 'Security Features',
+    description: 'Session re-login, vault locks & zero-trust rules',
     isViewTool: true,
     prompt: ''
   }
@@ -247,9 +289,15 @@ export interface ChatMessage {
 export default function App() {
   const grade = LOCKED_GRADE;
 
+  const [lastActivityTimestamp, setLastActivityTimestamp] = useState<number>(() => {
+    const raw = Number(localStorage.getItem(LAST_ACTIVITY_STORAGE_KEY));
+    return Number.isFinite(raw) && raw > 0 ? raw : Date.now();
+  });
+
   const [verifiedIdentity, setVerifiedIdentity] = useState<IdVerificationResult | null>(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('autostart') === '1') {
+      localStorage.setItem(LAST_ACTIVITY_STORAGE_KEY, String(Date.now()));
       return signVerifiedIdentity({
         verified: true,
         confidence: 99,
@@ -272,16 +320,23 @@ export default function App() {
       const saved = localStorage.getItem('medhavi_verified_id');
       if (saved) {
         const parsed = JSON.parse(saved) as IdVerificationResult;
+        const storedLastActivity = Number(localStorage.getItem(LAST_ACTIVITY_STORAGE_KEY)) || 0;
         if (
           verifyIdentityIntegrity(parsed) &&
-          (parsed.extractedRole !== 'teacher' || Boolean(parsed.serverSeal))
+          (parsed.extractedRole !== 'teacher' || Boolean(parsed.serverSeal)) &&
+          !isIdentitySessionExpired(parsed, storedLastActivity)
         ) {
+          if (!storedLastActivity) {
+            localStorage.setItem(LAST_ACTIVITY_STORAGE_KEY, String(Date.now()));
+          }
           return parsed;
         }
         localStorage.removeItem('medhavi_verified_id');
+        localStorage.removeItem(LAST_ACTIVITY_STORAGE_KEY);
       }
     } catch {
       localStorage.removeItem('medhavi_verified_id');
+      localStorage.removeItem(LAST_ACTIVITY_STORAGE_KEY);
     }
     return null;
   });
@@ -652,12 +707,55 @@ export default function App() {
     return () => window.removeEventListener('storage', handleStorageTamperCheck);
   }, []);
 
+  useEffect(() => {
+    if (!verifiedIdentity) return;
+
+    let lastRecorded = Date.now();
+    const recordActivity = () => {
+      const now = Date.now();
+      if (now - lastRecorded < 10_000) return;
+      lastRecorded = now;
+      setLastActivityTimestamp(now);
+      localStorage.setItem(LAST_ACTIVITY_STORAGE_KEY, String(now));
+    };
+
+    const verifySessionFreshness = () => {
+      const storedActivity =
+        Number(localStorage.getItem(LAST_ACTIVITY_STORAGE_KEY)) || lastActivityTimestamp;
+      if (isIdentitySessionExpired(verifiedIdentity, storedActivity)) {
+        const wasTeacher = verifiedIdentity.extractedRole === 'teacher';
+        void handleLogOutIdentity(
+          wasTeacher
+            ? 'Session Locked: You were inactive or signed out too long in Faculty Studio. Please sign in again to access studios.'
+            : 'Session Expired: Your 12-hour Scholar session ended. Please sign in again.'
+        );
+      }
+    };
+
+    window.addEventListener('pointerdown', recordActivity, { passive: true });
+    window.addEventListener('keydown', recordActivity, { passive: true });
+    window.addEventListener('touchstart', recordActivity, { passive: true });
+    document.addEventListener('visibilitychange', verifySessionFreshness);
+    const intervalId = window.setInterval(verifySessionFreshness, 15_000);
+
+    return () => {
+      window.removeEventListener('pointerdown', recordActivity);
+      window.removeEventListener('keydown', recordActivity);
+      window.removeEventListener('touchstart', recordActivity);
+      document.removeEventListener('visibilitychange', verifySessionFreshness);
+      window.clearInterval(intervalId);
+    };
+  }, [verifiedIdentity, lastActivityTimestamp]);
+
   const handleCompleteIdentityGate = (result: IdVerificationResult) => {
     const signed = verifyIdentityIntegrity(result) ? result : signVerifiedIdentity(result);
     if (!verifyIdentityIntegrity(signed)) {
       showToast('Security Alert: Identity verification failed integrity check.', 'error');
       return;
     }
+    const now = Date.now();
+    setLastActivityTimestamp(now);
+    localStorage.setItem(LAST_ACTIVITY_STORAGE_KEY, String(now));
     setCurtainUnlockedInSession(false);
     setVerifiedIdentity(signed);
     setActiveDockTool('chat');
@@ -688,6 +786,9 @@ export default function App() {
       showToast('Security Policy: Invalid Teacher credentials blocked.', 'error');
       return;
     }
+    const now = Date.now();
+    setLastActivityTimestamp(now);
+    localStorage.setItem(LAST_ACTIVITY_STORAGE_KEY, String(now));
     setCurtainUnlockedInSession(false);
     setVerifiedIdentity(signed);
     setActiveDockTool('chat');
@@ -842,7 +943,7 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
     );
   };
 
-  const handleLogOutIdentity = async () => {
+  const handleLogOutIdentity = async (reasonMessage?: unknown) => {
     stopAllScholarlySpeech();
     setSpeakingMessageId(null);
     if (activeRecordingRef.current) {
@@ -851,10 +952,14 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
       setComposerDictating(false);
     }
     localStorage.removeItem('medhavi_verified_id');
+    localStorage.removeItem(LAST_ACTIVITY_STORAGE_KEY);
     setCurtainUnlockedInSession(false);
     setVerifiedIdentity(null);
     setActiveDockTool('chat');
     setDrawerOpen(false);
+    if (typeof reasonMessage === 'string' && reasonMessage.trim()) {
+      showToast(reasonMessage, 'error');
+    }
     if (user) {
       await signOutScholar().catch(() => {});
     }
@@ -1369,10 +1474,10 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
           'Explain Photosynthesis and Aerobic Respiration in Class 7 ICSE Biology.',
           'Compare Conduction, Convection & Radiation in Class 7 Physics.',
           'Give me a 5-question ICSE Class 7 Mathematics & Science revision quiz.',
-          'Create a 5-minute revision sheet for ICSE Class 7 Linear Equations.'
+          'Tell me about Seth M.R. Jaipuria School’s philosophy, motto, four houses, and campus facilities.'
         ]
       : [
-          'Design a 40-minute ICSE Class 7 lesson plan on Heat & Temperature.',
+          'Design a 40-minute ICSE Class 7 lesson plan on Heat & Temperature aligned with our School of Conscious Transformation.',
           'Evaluate a student descriptive answer out of 10 marks.',
           'Draft a bilingual (English & Hindi) circular for parents.',
           'Build a 4-tier CISCE project rubric for Class 7 Science.'
@@ -1406,6 +1511,7 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
     if (toolId === 'revision') return <Zap className="w-4 h-4 shrink-0" />;
     if (toolId === 'evaluator') return <Award className="w-4 h-4 shrink-0" />;
     if (toolId === 'lesson_arch') return <Clock className="w-4 h-4 shrink-0" />;
+    if (toolId === 'security_panel') return <ShieldCheck className="w-4 h-4 shrink-0" />;
     return <Compass className="w-4 h-4 shrink-0" />;
   };
 
@@ -2168,11 +2274,46 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
       );
     }
 
+    if (activeDockTool === 'security_panel' && verifiedIdentity) {
+      return (
+        <div className="max-w-5xl mx-auto w-full space-y-5">
+          <div className={`flex flex-wrap items-center justify-between gap-2 pb-3 border-b ${borderHairline} no-print`}>
+            <button
+              type="button"
+              onClick={() => setActiveDockTool('chat')}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0B2559] text-white text-xs font-semibold cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Back to Assistant</span>
+            </button>
+            <span className="text-xs font-mono font-semibold flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Security Features Charter</span>
+            </span>
+          </div>
+          <SecurityFeaturesDashboard
+            isLight={isLight}
+            verifiedIdentity={verifiedIdentity}
+            facultyIdleTimeoutMinutes={FACULTY_IDLE_TIMEOUT_MINUTES}
+            sessionMaxHours={SESSION_MAX_AGE_HOURS}
+            lastActivityTimestamp={lastActivityTimestamp}
+            onLockAndRelogin={() =>
+              void handleLogOutIdentity(
+                'Session Locked: Please sign in again to access your studio.'
+              )
+            }
+            onOpenRestrictedTestStudio={() => setActiveDockTool('qpaper')}
+            onShowToast={showToast}
+          />
+        </div>
+      );
+    }
+
     // LIVELY CENTERED EMPTY STATE OVER ARCHITECTURAL GRID
     if (messages.length === 0) {
       const promptTags =
         persona === 'student'
-          ? ['Biology', 'Physics', '5-Q Quiz', 'Revision']
+          ? ['Biology', 'Physics', '5-Q Quiz', 'School Info']
           : ['Lesson Plan', 'Evaluation', 'Circular', 'Rubric'];
       const featuredChapters = [
         GRADE_7_TEXTBOOK_CATALOG.find((c) => c.id === 'math-ch1-integers'),
@@ -2184,9 +2325,9 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
       return (
         <div className="flex-1 flex flex-col items-center justify-center w-full max-w-3xl mx-auto px-4 pb-10">
           <div className="w-full space-y-6">
-            <div className="text-center space-y-3">
+            <div className="text-center space-y-2.5">
               <div className="text-[11px] font-mono font-bold uppercase tracking-[0.18em] text-[#0B2559] dark:text-[#94A3B8]">
-                ICSE Class 7 · CISCE &amp; NCSE · मेधावी
+                School of Conscious Transformation · Tamso Ma Jyotirgamaya · मेधावी
               </div>
               <h1 className="text-4xl sm:text-5xl font-bold font-display tracking-[-0.035em] leading-[1.04] text-[#0A0A0A] dark:text-[#F4F4F0]">
                 Ready when you are,{' '}
@@ -2194,6 +2335,18 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
                   {firstName}.
                 </span>
               </h1>
+              <p className={`text-xs font-mono ${mutedInk}`}>
+                ICSE Class 7 · Guided by{' '}
+                <a
+                  href="https://www.sethmrjaipuria.school/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline underline-offset-2 hover:text-[#0B2559] dark:hover:text-white"
+                >
+                  sethmrjaipuria.school
+                </a>{' '}
+                · Sustainability, Possibility, Integrity, Collaboration &amp; Empathy
+              </p>
             </div>
 
             {renderSleekPromptBar(true)}

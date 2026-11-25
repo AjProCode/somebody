@@ -261,7 +261,7 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
             <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono font-bold uppercase tracking-[0.16em] text-[#0B2559] dark:text-[#94A3B8]">
               <span>Seth M.R. Jaipuria School</span>
               <span aria-hidden="true">·</span>
-              <span>ICSE Class 7</span>
+              <span>School of Conscious Transformation</span>
               <span aria-hidden="true">·</span>
               <span>मेधावी</span>
             </div>
@@ -274,7 +274,16 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
             </h1>
 
             <p className={`text-sm sm:text-base leading-relaxed max-w-lg font-medium ${mutedInk}`}>
-              Step-by-step CISCE concept clarity, timed revision quizzes, voice study notes, and dedicated Faculty lesson &amp; assessment studios — tailored for Seth M.R. Jaipuria School, Lucknow.
+              Guided by <span className="italic">Tamso Ma Jyotirgamaya</span> — blending Indian ethos with 21st-century STEAM inquiry, CISCE concept clarity, school knowledge, and Faculty studios for{' '}
+              <a
+                href="https://www.sethmrjaipuria.school/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 font-semibold text-[#0B2559] dark:text-[#F4F4F0] hover:opacity-80"
+              >
+                Seth M.R. Jaipuria School, Lucknow
+              </a>
+              .
             </p>
           </div>
 
@@ -544,7 +553,14 @@ export const IdentityGatePage: React.FC<IdentityGatePageProps> = ({
         }`}
       >
         <span>Seth M.R. Jaipuria School · Lucknow · Tamso Ma Jyotirgamaya</span>
-        <span>ICSE Class 7 Academic Companion · Guided Study &amp; Faculty Studios</span>
+        <a
+          href="https://www.sethmrjaipuria.school/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hover:underline"
+        >
+          sethmrjaipuria.school · School of Conscious Transformation
+        </a>
       </footer>
 
       <CreateDemoAccountModal

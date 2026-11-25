@@ -1515,6 +1515,101 @@ export function inferGrade7Subject(query: string, explicitSubject?: string): str
   return undefined;
 }
 
+const TEXTBOOK_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'that',
+  'this',
+  'from',
+  'into',
+  'about',
+  'what',
+  'when',
+  'where',
+  'which',
+  'who',
+  'whom',
+  'whose',
+  'why',
+  'how',
+  'are',
+  'was',
+  'were',
+  'been',
+  'being',
+  'have',
+  'has',
+  'had',
+  'does',
+  'did',
+  'can',
+  'could',
+  'should',
+  'would',
+  'will',
+  'shall',
+  'may',
+  'might',
+  'must',
+  'you',
+  'your',
+  'yours',
+  'they',
+  'them',
+  'their',
+  'theirs',
+  'our',
+  'ours',
+  'his',
+  'her',
+  'hers',
+  'its',
+  'not',
+  'but',
+  'all',
+  'any',
+  'one',
+  'two',
+  'three',
+  'many',
+  'much',
+  'some',
+  'more',
+  'most',
+  'very',
+  'just',
+  'also',
+  'then',
+  'than',
+  'here',
+  'there',
+  'explain',
+  'describe',
+  'define',
+  'tell',
+  'give',
+  'gave',
+  'given',
+  'show',
+  'please',
+  'help',
+  'class',
+  'grade',
+  'icse',
+  'ncse',
+  'ncert',
+  'chapter',
+  'topic',
+  'question',
+  'answer'
+]);
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function searchGrade7TextbookReferences(params: {
   subject?: string;
   query: string;
@@ -1522,7 +1617,9 @@ export function searchGrade7TextbookReferences(params: {
 }): TextbookSearchMatch[] {
   const { subject, query, limit = 3 } = params;
   const normalizedQuery = (query || '').toLowerCase();
-  const tokens = tokenize(query || '');
+  const uniqueTokens = Array.from(
+    new Set(tokenize(query || '').filter((tok) => tok.length >= 3 && !TEXTBOOK_STOP_WORDS.has(tok)))
+  );
   const resolvedSubject = inferGrade7Subject(query, subject);
 
   const scored: TextbookSearchMatch[] = GRADE_7_TEXTBOOK_CATALOG.map((chapter) => {
@@ -1533,21 +1630,25 @@ export function searchGrade7TextbookReferences(params: {
       score += 4;
     }
 
-    // Exact keyword phrase matches
+    // Exact whole-word/phrase keyword matches
     for (const kw of chapter.keywords) {
-      if (normalizedQuery.includes(kw.toLowerCase())) {
-        score += kw.includes(' ') ? 7 : 4.5;
+      const lowerKw = kw.toLowerCase().trim();
+      if (!lowerKw) continue;
+      const pattern = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegExp(lowerKw)}(?:$|[^\\p{L}\\p{N}])`, 'u');
+      if (pattern.test(normalizedQuery)) {
+        score += lowerKw.includes(' ') ? 7 : 4.5;
       }
     }
 
-    // Title, concepts, and summary token overlap
-    const haystack = `${chapter.title} ${chapter.textbook} ${chapter.publisher} ${chapter.summary} ${chapter.keyConcepts.join(' ')} ${chapter.formulasOrFacts.join(' ')} ${chapter.ncseBridge}`.toLowerCase();
-    for (const tok of tokens) {
-      if (tok.length < 3) continue;
-      if (chapter.title.toLowerCase().includes(tok)) {
+    // Whole-word token overlap against title and chapter text (never substring matching like "you" in "your")
+    const titleTokens = new Set(tokenize(chapter.title));
+    const haystack = `${chapter.title} ${chapter.textbook} ${chapter.publisher} ${chapter.summary} ${chapter.keyConcepts.join(' ')} ${chapter.formulasOrFacts.join(' ')} ${chapter.ncseBridge}`;
+    const haystackTokens = new Set(tokenize(haystack));
+    for (const tok of uniqueTokens) {
+      if (titleTokens.has(tok)) {
         score += 3;
-      } else if (haystack.includes(tok)) {
-        score += 1.25;
+      } else if (haystackTokens.has(tok)) {
+        score += 1.5;
       }
     }
 
@@ -1574,7 +1675,7 @@ export function searchGrade7TextbookReferences(params: {
     return strongMatches.slice(0, limit);
   }
 
-  // Return top chapters for the resolved subject when available
+  // Return top chapters ONLY when an explicit/inferred subject is known
   if (resolvedSubject) {
     const subjectFallback = sorted.filter(
       (m) => m.subject.toLowerCase() === resolvedSubject.toLowerCase()
@@ -1584,7 +1685,7 @@ export function searchGrade7TextbookReferences(params: {
     }
   }
 
-  return sorted.slice(0, Math.min(2, limit));
+  return [];
 }
 
 export function formatTextbookGroundingBlock(matches: TextbookSearchMatch[]): string {
