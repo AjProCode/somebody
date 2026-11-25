@@ -1201,10 +1201,13 @@ If an isosceles triangle has one vertex angle of \\(80^\\circ\\), what must each
               webSearchEnabled: effectiveWebSearch
             },
             webSearchEnabled: effectiveWebSearch,
-            verifiedIdentity
+            verifiedIdentity,
+            imageDataUrl: currentImage,
+            workflowMeta: options?.workflowMeta || {}
           })
         });
-        if (fallbackRes.ok) {
+        const fallbackContentType = fallbackRes.headers.get('content-type') || '';
+        if (fallbackRes.ok && fallbackContentType.includes('application/json')) {
           const fallbackData = await fallbackRes.json();
           if (fallbackData.reply && fallbackData.reply.trim()) {
             accumulatedText = fallbackData.reply;

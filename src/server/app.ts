@@ -53,11 +53,25 @@ export const DEFAULT_ELEVENLABS_KEY =
     ? process.env.ELEVENLABS_API_KEY.trim()
     : '';
 
-// Server-only 256-bit HMAC secret for sealing verified identities (cannot be forged in DevTools)
+// Server-only 256-bit HMAC secret for sealing verified identities (stable across serverless instances)
 const SERVER_HMAC_SECRET =
   process.env.MEDHAVI_SESSION_SECRET && process.env.MEDHAVI_SESSION_SECRET.trim().length >= 16
     ? process.env.MEDHAVI_SESSION_SECRET.trim()
-    : crypto.randomBytes(32).toString('hex');
+    : crypto
+        .createHash('sha256')
+        .update(
+          [
+            'smrj-medhavi-icse7-hmac-v1',
+            process.env.VERCEL_PROJECT_ID || '',
+            process.env.K_SERVICE || '',
+            process.env.OPENROUTER_API_KEY || '',
+            process.env.GEMINI_API_KEY || ''
+          ].join('|')
+        )
+        .digest('hex');
+
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+let openRouterCooldownUntil = 0;
 
 const IDENTITY_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 
@@ -1296,8 +1310,12 @@ export function createApp(): Express {
     const heartbeat = setInterval(() => {
       safeWrite(': ping\n\n');
     }, 5000);
-    req.on('close', () => {
-      clientClosed = true;
+    // In Node 18+, req 'close' fires immediately when POST body finishes reading!
+    // Listen to res 'close' instead to detect actual client disconnects mid-stream.
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+      }
       clearInterval(heartbeat);
     });
 
@@ -1362,7 +1380,8 @@ export function createApp(): Express {
       return;
     }
 
-    const userMsgs = messages.filter((m: any) => m && m.role !== 'assistant');
+    const safeMessages = Array.isArray(messages) ? messages : [];
+    const userMsgs = safeMessages.filter((m: any) => m && m.role !== 'assistant');
     const lastUserMsg = String(
       userMsgs[userMsgs.length - 1]?.content ||
         'Explain this ICSE Class 7 concept clearly.'
@@ -1512,10 +1531,16 @@ export function createApp(): Express {
     let activeSourceName = 'openrouter-live';
     let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
-    if (openRouterKey) {
+    const openRouterInCooldown =
+      Boolean(getServerGeminiApiKey()) && Date.now() < openRouterCooldownUntil;
+
+    if (openRouterKey && !openRouterInCooldown) {
       // 1a. Try OpenRouter streaming (nvidia/nemotron-3.5-super-vl:free) with active end-to-end stream timeout
       const streamController = new AbortController();
-      const streamTimeout = setTimeout(() => streamController.abort(), 15000);
+      const streamTimeout = setTimeout(
+        () => streamController.abort(),
+        IS_SERVERLESS ? 9000 : 12000
+      );
       let skipUnaryRetry = false;
       try {
         const upstream = await fetch(OPENROUTER_ENDPOINT, {
@@ -1589,11 +1614,13 @@ export function createApp(): Express {
           fallbackReason = `stream_http_${upstream.status}: ${errText.slice(0, 180)}`;
           if (upstream.status === 429 || upstream.status >= 500) {
             skipUnaryRetry = true;
+            openRouterCooldownUntil = Date.now() + 60_000;
           }
         }
       } catch (err: any) {
         fallbackReason = `stream_error: ${err?.message || 'unknown'}`.slice(0, 180);
         skipUnaryRetry = true;
+        openRouterCooldownUntil = Date.now() + 60_000;
       } finally {
         clearTimeout(streamTimeout);
       }
@@ -1601,7 +1628,7 @@ export function createApp(): Express {
       // 1b. Only retry non-streaming OpenRouter if streaming returned empty cleanly (not timed out / rate-limited)
       if (!streamedText.trim() && !skipUnaryRetry && !clientClosed) {
         const unaryController = new AbortController();
-        const unaryTimeout = setTimeout(() => unaryController.abort(), 10000);
+        const unaryTimeout = setTimeout(() => unaryController.abort(), IS_SERVERLESS ? 7000 : 9000);
         try {
           const unaryResp = await fetch(OPENROUTER_ENDPOINT, {
             method: 'POST',
@@ -1796,7 +1823,8 @@ export function createApp(): Express {
         return;
       }
 
-      const userMsgs = messages.filter((m: any) => m && m.role !== 'assistant');
+      const safeMessages = Array.isArray(messages) ? messages : [];
+      const userMsgs = safeMessages.filter((m: any) => m && m.role !== 'assistant');
       const lastUserMsg = String(
         userMsgs[userMsgs.length - 1]?.content ||
           'Explain this ICSE Class 7 concept clearly.'
@@ -1923,9 +1951,12 @@ export function createApp(): Express {
         .join('\n\n');
       let fallbackReason = openRouterKey ? '' : 'missing_api_key';
 
-      if (openRouterKey) {
+      const openRouterInCooldown =
+        Boolean(getServerGeminiApiKey()) && Date.now() < openRouterCooldownUntil;
+
+      if (openRouterKey && !openRouterInCooldown) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
+        const timeout = setTimeout(() => controller.abort(), IS_SERVERLESS ? 9000 : 12000);
         try {
           const orMessages = buildOpenRouterMessages(systemPrompt, messages, imageDataUrl);
 
@@ -1977,9 +2008,13 @@ export function createApp(): Express {
           } else {
             const errText = await upstream.text().catch(() => '');
             fallbackReason = `http_${upstream.status}: ${errText.slice(0, 180)}`;
+            if (upstream.status === 429 || upstream.status >= 500) {
+              openRouterCooldownUntil = Date.now() + 60_000;
+            }
           }
         } catch (err: any) {
           fallbackReason = `error: ${err?.message || 'unknown'}`.slice(0, 180);
+          openRouterCooldownUntil = Date.now() + 60_000;
         } finally {
           clearTimeout(timeout);
         }
@@ -1990,7 +2025,7 @@ export function createApp(): Express {
         systemPrompt,
         messages,
         imageDataUrl,
-        14000
+        12000
       );
       if (geminiReply) {
         const cleanReply = stripBookReferenceFooters(
@@ -2043,6 +2078,7 @@ export function createApp(): Express {
         ...(fallbackReason ? { fallbackReason } : {})
       });
     } catch (err) {
+      console.error('[Medhavi /api/chat unexpected error]:', err);
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Chat error'
       });
